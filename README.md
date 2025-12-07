@@ -3,127 +3,229 @@ Intelligent Ground Vehicle Competition: This project will be related to autonomo
 Website:
 https://kopil46.github.io/IGVC_Website_2025/#hero
 
-
 IGVC Software Working Mechanism & Source Code Documentation
 Introduction
-This document explains how the major software components of the IGVC platform operate and how they interact with each other. The system consists of several subsystems: the Jetson camera processing pipeline, the manual sender module, the motor-control receiver, the auto/manual drive controller, the GPS parser, and the encoder subsystem. Together, these modules handle perception, communication, and actuation for the robot.
-The focus of this document is on the working mechanism and code behavior of each part so that future teams can understand the software flow and continue development without confusion.
+
+This document explains how the major software components of the IGVC platform operate and how they interact with each other. The system consists of several subsystems: the Jetson camera processing pipeline, the manual sender module, the motor-control receiver, the auto/manual drive controller, the GPS parser, and the encoder subsystem. Together, these modules handle perception, communication, and actuation for the robot. The focus is on the working mechanism and code behavior of each part so that future teams can understand the software flow and continue development without confusion.
 
 1. Jetson Camera Processing (Camera Part 1)
-The Jetson handles the main perception tasks using USB cameras. The camera script processes live video frames, extracts lane information, and determines the robot’s driving intent.
+
+The Jetson performs the main perception tasks using USB cameras. The camera script processes live video frames, extracts lane information, and determines the robot’s driving intent.
+
 Working Mechanism
-1.	The camera feed is opened using OpenCV.
-2.	A specific region of interest is selected to isolate the road area and ignore irrelevant parts of the image.
-3.	The frame is converted to grayscale and blurred to remove noise.
-4.	A binary threshold is applied so that only bright lane features remain visible.
-5.	Contours or edges are extracted to identify the left and right lane boundaries.
-6.	The script computes how far the lane center is from the frame’s horizontal center.
-7.	Based on this offset, the system decides whether the robot should go straight, turn left, or turn right.
-8.	A command string (for example: “Forward Half”, “Left Half”, “Right Half”, or “Stop”) is generated.
-9.	The command is sent through the serial port to the motor controller system using a typewriter-style serial transmit method to ensure clean transmission.
-10.	The processed binary lane view is displayed for debugging so the operator can visually confirm that lane extraction is working.
-Notes on Behavior
-•	When lane lines disappear, the script shuts the camera off for safety and waits until lanes reappear.
-•	All decisions are text-based, so the Jetson only sends simple command words rather than low-level motor values.
-•	This module serves as the autonomous steering logic for lane following.
+
+The camera feed is opened using OpenCV.
+
+A region of interest is selected to isolate the road area.
+
+The frame is converted to grayscale and blurred to reduce noise.
+
+A binary threshold is applied to identify bright lane features.
+
+Contours or edges are extracted to locate left and right lane boundaries.
+
+The script calculates how far the lane center is from the image center.
+
+Based on this offset, the system chooses whether to go straight, turn left, or turn right.
+
+A command string such as “Forward Half”, “Left Half”, “Right Half”, or “Stop” is generated.
+
+The command is sent to the motor controller through serial communication.
+
+A binary lane-mask window is displayed for debugging.
+
+Notes
+
+If lane lines disappear, the camera script shuts off motion and waits for valid lane readings.
+
+The Jetson only sends text commands, not motor values.
+
+This module provides the autonomous lane-following steering logic.
 
 2. Manual Sender (NRF24 TM4C Sender)
-The sender microcontroller is responsible for transmitting driving commands wirelessly using an NRF24L01 module. It receives text commands from a PC or Jetson over UART and converts them into compact RF packets.
+
+The sender microcontroller transmits driving commands wirelessly through an NRF24L01 module. It receives text commands over UART and converts them to compact RF packets.
+
 Working Mechanism
-1.	System clock, UART0, UART1, SPI, and RGB LEDs are initialized.
-2.	The NRF24 radio is configured in TX mode using a fixed address and channel.
-3.	When a line of text is entered on UART0 (such as “Forward Half”), the microcontroller parses the text into tokens.
-4.	The command is converted to a short RF sequence such as:
-•	FH (Forward Half)
-•	BH (Backward Half)
-•	LH (Left Half)
-•	RH (Right Half)
-•	ST (Stop)
-5.	The NRF24 transmits the data and waits for a successful acknowledgment.
-6.	LEDs change color depending on the command type to provide visual debugging feedback.
-7.	If the Stop command is received, the sender immediately sends the stop code and resets internal states.
-Notes on Behavior
-•	Transmission uses short fixed-length packets to maintain reliability.
-•	All parsing and command translation happen on the sender so the receiver only needs to interpret compact codes.
-•	Sabertooth debug output may also be generated over UART1 when needed.
+
+Initializes system clock, UART0, UART1, SPI, and RGB LEDs.
+
+Configures the NRF24 radio in TX mode.
+
+Parses UART text commands such as “Forward Half”.
+
+Converts them into RF packets like:
+
+FH (Forward Half)
+
+BH (Backward Half)
+
+LH (Left Half)
+
+RH (Right Half)
+
+ST (Stop)
+
+Transmits packets and waits for acknowledgment.
+
+LED colors reflect the command sent.
+
+Stop commands are immediately transmitted and internal states are reset.
+
+Notes
+
+Uses fixed-length packets to improve reliability.
+
+Parsing happens entirely on the sender, keeping the receiver logic simple.
+
+May also send debug values to the Sabertooth UART.
 
 3. Motor Controller Receiver (NRF24 TM4C Receiver)
-The receiver microcontroller listens for incoming RF packets and directly drives the robot motors using the Sabertooth motor controller. It also manages the light tower indicators for safety and mode signaling.
+
+The receiver microcontroller listens for RF packets and directly controls the robot’s motors using the Sabertooth driver or alternate motor drivers. It also manages the tower light indicators.
+
 Working Mechanism
-1.	Hardware initialization sets up UART1 for Sabertooth communication, PWM for new motor drivers communication, SPI for NRF24, and GPIO for tower LEDs.
-2.	The NRF24 is configured in RX mode and waits for packets from the sender.
-3.	Once a packet is received, the two-letter motion code is checked:
-•	FH → Forward Half
-•	BH → Backward Half
-•	LH → Left Half
-•	RH → Right Half
-•	ST → Stop
-•	AU → Auto mode
-•	MA → Manual mode
-4.	The receiver maps the code to actual Sabertooth serial drive commands by controlling both motor channels. It also maps the code to set the direction pins in the new motor drivers. It means that it can work with any of the motor driver that is connected to it. 
-5.	Direction bits and speed values are computed based on the command type. One motor direction is reversed to match the robot’s physical wiring.
-6.	The light tower updates according to the current mode:
-•	Manual mode: solid indication
-•	Auto mode: dynamic flashing pattern
-•	Stop: red
-7.	The Stop command overrides everything and immediately forces zero output to the motors.
-Notes on Behavior
-•	Commands are kept small so that decoding is fast and consistent.
-•	Speed limits are intentionally capped for safe movement.
-•	The receiver acts as the final authority for robot motion since all commands terminate here.
-•	Code is kept constant to work for both motor drivers, the sabertooth and the cheap motor drivers – HC-160A SC.
+
+Initializes UART1 for Sabertooth communication, PWM for alternate drivers, SPI for NRF24, and LED tower GPIO.
+
+Configures NRF24 in RX mode and waits for incoming packets.
+
+Interprets received motion codes:
+
+FH → Forward Half
+
+BH → Backward Half
+
+LH → Left Half
+
+RH → Right Half
+
+ST → Stop
+
+AU → Auto mode
+
+MA → Manual mode
+
+Maps each code to Sabertooth serial commands or PWM direction pins for the motor driver in use.
+
+Calculates direction bits and speed values. One motor is reversed to match wiring.
+
+Updates tower light behavior:
+
+Manual mode: solid indicator
+
+Auto mode: flashing pattern
+
+Stop: solid red
+
+Stop overrides all motion immediately.
+
+Notes
+
+Packets are small for fast decoding.
+
+Speed caps are enforced for safety.
+
+The receiver is the last step in the chain before the motors.
+
+The same control logic works for both Sabertooth and HC-160A SC motor drivers.
 
 4. Auto/Manual Arrow-Key Drive Controller (PC Python Script)
-This script is used for manual tele-operation using a standard computer keyboard. It allows switching between Auto and Manual modes and sends direction commands based on held arrow keys.
+
+A Python script on the PC enables manual tele-operation using keyboard arrow keys and lets the operator switch between Auto and Manual modes.
+
 Working Mechanism
-1.	Opens a serial COM port with proper baud settings and boot timing.
-2.	Hooks global keyboard events using the keyboard library.
-3.	Pressing arrow keys generates continuous motion commands:
-•	Up → Forward Half
-•	Down → Backward Half
-•	Left → Left Half
-•	Right → Right Half
-4.	Releasing all keys automatically sends a Stop command.
-5.	Pressing A switches to Auto mode and sends “Auto” to the system.
-6.	Pressing M switches to Manual mode.
-7.	Commands are only transmitted when they change from the previous state to reduce serial spam.
-8.	A typewriter-style serial transmitter sends data byte-by-byte with delays to prevent buffer overflows on the receiving microcontroller.
-Notes on Behavior
-•	This script does not talk to motors directly; it only sends text commands.
-•	It is very useful for testing movement and verifying receiver functionality without any camera input.
+
+Opens a serial COM port with proper baud rate and delay settings.
+
+Captures keyboard events through the keyboard library.
+
+Arrow keys map to:
+
+Up → Forward Half
+
+Down → Backward Half
+
+Left → Left Half
+
+Right → Right Half
+
+Releasing keys automatically sends a Stop command.
+
+Pressing “A” switches to Auto mode.
+
+Pressing “M” switches to Manual mode.
+
+Commands are only sent when different from the last command to reduce spam.
+
+Uses a byte-by-byte typewriter transmission style.
+
+Notes
+
+The PC script never touches the motors directly.
+
+Very useful for debugging motion without camera input.
 
 5. GPS Module (TM4C GPS Parser)
-The GPS subsystem reads NMEA data from a GPS module and extracts key geographic and positional data.
+
+The GPS subsystem processes NMEA sentences from a GPS receiver and extracts geographic location data.
+
 Working Mechanism
-1.	UART3 receives NMEA strings at 9600 baud.
-2.	Characters are stored until a full line ending in newline is detected.
-3.	Only GGA sentences are processed.
-4.	The line is split into fields corresponding to time, latitude, longitude, fix quality, HDOP, satellites, and altitude.
-5.	Latitude and longitude are converted from ddmm.mmmm format to decimal degrees.
-6.	Results are printed out for monitoring or logged for navigation.
+
+UART3 receives NMEA characters at 9600 baud.
+
+Characters accumulate until a full line is received.
+
+GGA sentences are identified and parsed.
+
+The line is split into fields for time, latitude, longitude, fix quality, HDOP, satellites, and altitude.
+
+Latitude and longitude are converted from ddmm.mmmm format into decimal degrees.
+
+Parsed values are displayed or logged for navigation.
+
 Notes
-•	The parser checks for valid fix quality before reporting position.
-•	The module currently provides situational awareness and logging rather than active navigation.
+
+Valid fix quality is required before data is used.
+
+Currently supports awareness and logging more than active navigation.
 
 6. Encoder Subsystem
-The encoder subsystem measures wheel movement so distance and odometry can be calculated.
+
+Encoders track wheel movement and help compute odometry values such as speed and distance.
+
 Working Mechanism
-1.	Wheel encoders produce pulses as the wheels rotate.
-2.	The microcontroller counts these pulses using interrupt routines or edge-triggered GPIO.
-3.	Each wheel has a counter storing accumulated ticks.
-4.	Distance is computed using wheel circumference and ticks-per-revolution.
-5.	Speed can be derived by counting pulses per unit time.
-6.	These values may be transmitted or used for higher-level control if needed.
+
+Wheel encoders generate pulses during rotation.
+
+Interrupts or GPIO edge detections count these pulses.
+
+Each wheel has its own counter.
+
+Distance is computed using wheel circumference and ticks-per-revolution.
+
+Speed is obtained by measuring pulse frequency.
+
+Values may support future closed-loop control or movement verification.
+
 Notes
-•	Encoders help verify that commanded motion matches actual movement.
-•	They are not currently used for closed-loop control but are available for expansion.
+
+Encoders help confirm that commanded motion matches actual behavior.
+
+Currently not used for real-time control loops, but fully available for expansion.
 
 System Flow Summary
-1.	The Jetson processes the camera feed, detects lane lines, and determines the intended steering direction.
-2.	It sends readable text commands (“Forward Half”, “Left Half”, etc.) through serial output.
-3.	The sender TM4C converts these commands into NRF24 packets and transmits them wirelessly.
-4.	The receiver TM4C decodes the packets and drives the motors through the Sabertooth controller.
-5.	The receiver updates tower lights and enforces safety behaviors such as Stop and mode changes.
-6.	Manual control is available at any time using the arrow-key driving script or PC text input.
-7.	GPS and encoders provide additional positional and motion data for navigation and analysis.
 
+The Jetson processes camera frames, extracts lane geometry, and determines the driving direction.
+
+It sends text commands such as “Forward Half” through serial output.
+
+The sender TM4C converts these commands into NRF24 packets and transmits them.
+
+The receiver TM4C decodes the packets and drives the motors through the Sabertooth or alternate drivers.
+
+The receiver also updates tower indicators and enforces safety modes such as Stop.
+
+Manual control through the PC arrow-key script or text commands is available at any time.
+
+GPS and encoder data provide additional information for navigation and diagnostics.
