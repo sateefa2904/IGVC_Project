@@ -1,0 +1,13 @@
+"./clock.obj"
+"./gpio.obj"
+"./main.obj"
+"./nrf0.obj"
+"./rgb_led.obj"
+"./setupuart.obj"
+"./spi0.obj"
+"./tm4c123gh6pm_startup_ccs.obj"
+"./uart0.obj"
+"./uart1.obj"
+"./wait.obj"
+"../tm4c123gh6pm.cmd"
+-llibc.a
