@@ -25,11 +25,16 @@ import numpy as np
 import cv2
 import serial
 from rplidar import RPLidar, RPLidarException
+import os
+import sys
+import fcntl
+import atexit
 
 # =========================
 # Serial / driving config
 # =========================
 
+SERIAL_LOCK_PATH = "/tmp/tm4c_serial.lock" # DEBUG Phase 1: [SAteefa 3/21: added to enforce one-way pathway and prevent interleaving]
 PORT = "/dev/ttyACM0"   # change if needed
 BAUD = 19200
 EOL = "\r"              # TM4C parser ends on CR (13)
@@ -153,6 +158,62 @@ LOST_FRAMES_THRESH = 5
 # Serial helpers
 # =========================
 
+# DEBUG Phase 1: [SAteefa 3.21] Helper function for open_serial
+
+#[SAteefa 3/21 Added: lock-file helper to ensure only one script owns the TM4c serial port at a time]
+# Prevents multiple scripts from writing to TM4C at the same time by using an exclusive lock file
+class SerialPortLock:
+    def __init__(self, lock_path):
+        self.lockpath = lock_path   #path to the lock file used to cooredinate port ownership
+        self.fd = None              #file descriptor for the lock file
+    def acquire(self):
+        #[SAteefa 3/21 Added: open lock file in a+ mode so we can both write our PID and read existing owner's PID]
+        #Using "w" would erase contents and would not let us read back the current owner properly
+        self.fd = open(self.lock_path, "a+")
+        try:
+            #[SAteefa 3/21 Added: request a non-blocking exclusive lock]
+            # If this succeeds, this script becomes the only allowed owner of the TM4c serial resource
+            fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            #ADDED: clear old contents, then store this process ID in the lock file
+            # This helps identify which process currently owns the serial port.
+            self.fd.seek(0)
+            self.fd.truncate()
+            self.fd.write(str(os.getpid()))
+            self.fd.flush()
+
+
+            print(f"[LOCK] Acquired TM4C serial lock: {self.lock_path}")
+        except BlockingIOError:
+            #ADDED: if another process already owns the lock, read its PID for a clearer error message
+            self.fd.seek(0)
+            owner = self.fd.read().strip()
+
+
+            raise RuntimeError(
+                f"TM4c serial port is already owned by another process"
+                f"{' (PID ' + owner + ')' if owner else ''}. "
+                f"Stop the other script before running this one."
+            )
+    def relese(self):
+        if self.fd is not None:
+            try:
+                #[SAteefa 3/21] ADDED: clear the stored PID and release the exclusive lock during shutdown
+                #This prevents ownership from being left behind after the script exits
+                self.fd.seek(0)
+                self.fd.truncate()
+                fcntl.flock(self.fd.fileno(), fcntl.LOCK_UN)
+                print(f"[LOCK] Released TM4C serial lock : {self.lock_path}")
+            except Exception:
+                pass
+            try:
+                #close the lock-file handle after unlocking
+                self.fd.close()
+            except Exception:
+                pass
+            self.fd = None
+
+
 def open_serial():
     print("Opening serial:", PORT, "@", BAUD)
     ser = serial.Serial(
@@ -180,14 +241,24 @@ def send_line_typewriter(ser: serial.Serial, text: str):
         time.sleep(CHAR_DELAY)
 
 class MotorCommander:
-    def __init__(self, ser):
-        self.ser = ser
-        self.last_cmd = None
+    def __init__(self,ser,min_cmd_interval=0.08):
+        self.ser = ser              #serial connection to TM4C
+        self.last_cmd = None        #remembers the last command sent
+        self.last_send_time = 0.0   # [SAteefa 3/21 added: remembers when the last command was sent]
+        self.min_cmd_interval = min_cmd_interval # [SAteefa 3/21 added: minimum delay between non-forced command sends]
+    def send(self, cmd:str, force:bool=False):  # [SAteefa 3/21 added: allow critcal commands to bypass any duplication/timing suppression]
+        now = time.time()
 
-    def send(self, cmd: str):
-        if cmd != self.last_cmd:
-            send_line_typewriter(self.ser, cmd)
-            self.last_cmd = cmd
+        should_send = force or (cmd != self.last_cmd)  # [SAteefa 3/21 added: only send changed commands unless force=True]
+        if not should_send:
+            return  #skip duplicate command
+        
+        if not force and (now - self.last_send_time) < self.min_cmd_interval: # [SAteefa 3/21 added: throttle rapid back-to-back command sends to reduce serial spam/jitter]
+            return
+        
+        send_line_typewriter(self.ser,cmd) #transmit command to TM4c
+        self.last_cmd = cmd
+        self.last_send_time = now # [SAteefa 3/21 added: update timestamp after successful transmission]
 
 # =========================
 # LIDAR helpers
@@ -523,11 +594,25 @@ def open_side_camera(side: str):
 # =========================
 
 def run_integrated():
+    #[SAteefa 3/21 DEBUG Phase 1: To get rid of the bug, there might be another script that is interfering with this one which is inputting garbage; hence garbage output]
+    serial_lock = SerialPortLock(SERIAL_LOCK_PATH)
+    serial_lock.acquire()
+    atextit.register(serial_lock.release)
+    
     ser = open_serial()
-    mc  = MotorCommander(ser)
-    mc.send(STOP_CMD)
+    mc = MotorCommander(ser)
+
+    #[SAteefa 3/21 Added: startip banner to show which script and hardware ports are active]
+    print("=" * 60)
+    print("[BOOT] camera_part3.py starting")
+    print(f"[BOOT] TM4C port :{PORT}")
+    print(f"[BOOT] LIDAR port: {LIDAR_PORT}")
+    print(f"[BOOT] Active side starts on: LEFT")
+    print("=" * 60)
+
+    mc.send(STOP_CMD, force=True)
     time.sleep(0.2)
-    mc.send(CMD_AUTO)
+    mc.send(CMD_AUTO, force=True)
 
     # LIDAR
     angle_sign = ANGLE_SIGN_D
@@ -888,22 +973,29 @@ def run_integrated():
 
     finally:
         try:
-            mc.send(STOP_CMD)
+            mc.send(STOP_CMD) #stop the robot before shutting anything down
         except Exception:
             pass
         try:
             if cap is not None:
-                cap.release()
+                cap.release() #release the active camera so the device is freed
         except Exception:
             pass
         if USE_DISPLAY:
-            cv2.destroyAllWindows()
+            cv2.destroyAllWindows() #close any OpenCV display windows
         try:
-            lidar.stop(); lidar.stop_motor(); lidar.disconnect()
+            lidar.stop(); lidar.stop_motor(); lidar.disconnect() #safely stop and disconnect the lidar
         except Exception:
             pass
-        ser.close()
-        print("[INFO] Clean exit.")
+        try:
+            ser.close() #close the TM4C serial connection
+        except Exception:
+            pass
+        try:
+            serial_lock.release() #[SATEEFA 3/21] new: release the serial-port ownership lock so another script can use TM4c later
+        except Exception:
+            pass
+        print("[INFO] Clean exit.") # confirmation that shutdown completed
 
 if __name__ == "__main__":
     run_integrated()
