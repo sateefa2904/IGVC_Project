@@ -17,7 +17,30 @@ Integrated LIDAR + Lane-following with three main modes:
    - LIDAR keeps us centered between left/right obstacles, then we go
      forward for some time, turn back toward the origin side, switch
      that camera back on, and re-align to the lane (turn ≈ 0).
+
+Added safety hooks:
+- Stop sign placeholder
+- Pedestrian stop placeholder (blue dot)
+
 """
+# =========================================================
+# WARNING / CURRENT DEBUG STATUS
+# [SAteefa 3/22]
+# camera_part3.py is now the main integrated controller for:
+#   1) camera lane-following
+#   2) lidar obstacle handling
+#   3) future stop-sign / pedestrian stop hooks
+#
+# Current testing priority:
+#   Phase 1 = verify camera-only lane following works
+#   Phase 2 = verify lidar-only obstacle behavior works
+#   Phase 3 = verify full camera + lidar integration works
+#
+# NOTE:
+# Stop-sign / pedestrian code is added into the file,
+# but should remain disabled until base driving behavior is verified.
+# =========================================================
+
 
 import time
 import math
@@ -31,17 +54,33 @@ import fcntl
 import atexit
 
 # =========================
+# Debug / integration toggles
+# =========================
+# [SAteefa 3/21 Added: top-level mode switch so we can test one subsystem at a time]
+# CAMERA_ONLY = test only lane-following + TM4C output
+# LIDAR_ONLY  = test only obstacle / corridor logic
+# FULL        = full integrated behavior
+
+DEBUG_MODE = "CAMERA_ONLY" #CAMERA_ONLY, LIDAR_ONLY, FULL
+
+# [SAteefa 3/21 Added: phase-2 safety hooks]
+# These features are added into the integrated controller now so the architecture is ready,
+# but they should remain disabled during base camera/lidar debugging until separately tested.
+ENABLE_STOP_SIGN = False
+ENABLE_PEDESTRIAN_STOP = False
+
+# =========================
 # Serial / driving config
 # =========================
 
 SERIAL_LOCK_PATH = "/tmp/tm4c_serial.lock" # DEBUG Phase 1: [SAteefa 3/21: added to enforce one-way pathway and prevent interleaving]
 PORT = "/dev/ttyACM0"   # change if needed
 BAUD = 19200
-EOL = "\r"              # TM4C parser ends on CR (13)
+EOL = "\r"              # TM4C parser ends on carriage returnn
 DTR = True
 RTS = True
 CHAR_DELAY = 0.01       # 10 ms between bytes
-BOOT_WAIT = 2.0         # seconds after opening port
+BOOT_WAIT = 2.0         # wait after opening serial for TM4C boot
 
 CMD_UP     = "Forward Half"
 CMD_DOWN   = "Backward Half"
@@ -155,6 +194,13 @@ CAM_BACKEND     = cv2.CAP_V4L2   # or cv2.CAP_ANY
 LOST_FRAMES_THRESH = 5
 
 # =========================
+# Stop sign / pedestrian draft config
+# =========================
+
+STOP_SIGN_HOLD_SEC = 2.0  # [SAteefa 3/21 Added: placeholder timed stop for future stop-sign integration]
+
+
+# =========================
 # Serial helpers
 # =========================
 
@@ -164,7 +210,7 @@ LOST_FRAMES_THRESH = 5
 # Prevents multiple scripts from writing to TM4C at the same time by using an exclusive lock file
 class SerialPortLock:
     def __init__(self, lock_path):
-        self.lockpath = lock_path   #path to the lock file used to cooredinate port ownership
+        self.lock_path = lock_path   #path to the lock file used to cooredinate port ownership
         self.fd = None              #file descriptor for the lock file
     def acquire(self):
         #[SAteefa 3/21 Added: open lock file in a+ mode so we can both write our PID and read existing owner's PID]
@@ -175,7 +221,7 @@ class SerialPortLock:
             # If this succeeds, this script becomes the only allowed owner of the TM4c serial resource
             fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-            #ADDED: clear old contents, then store this process ID in the lock file
+            #[SAteefa 3/21 Added: clear old contents, then store this process ID in the lock file]
             # This helps identify which process currently owns the serial port.
             self.fd.seek(0)
             self.fd.truncate()
@@ -185,7 +231,7 @@ class SerialPortLock:
 
             print(f"[LOCK] Acquired TM4C serial lock: {self.lock_path}")
         except BlockingIOError:
-            #ADDED: if another process already owns the lock, read its PID for a clearer error message
+            # [SAteefa 3/21 Added: if another process already owns the lock, read its PID for a clearer error message]
             self.fd.seek(0)
             owner = self.fd.read().strip()
 
@@ -195,10 +241,10 @@ class SerialPortLock:
                 f"{' (PID ' + owner + ')' if owner else ''}. "
                 f"Stop the other script before running this one."
             )
-    def relese(self):
+    def release(self):
         if self.fd is not None:
             try:
-                #[SAteefa 3/21] ADDED: clear the stored PID and release the exclusive lock during shutdown
+                #[SAteefa 3/21 ADDED: clear the stored PID and release the exclusive lock during shutdown.]
                 #This prevents ownership from being left behind after the script exits
                 self.fd.seek(0)
                 self.fd.truncate()
@@ -240,6 +286,12 @@ def send_line_typewriter(ser: serial.Serial, text: str):
         ser.flush()
         time.sleep(CHAR_DELAY)
 
+
+# [SAteefa 3/22 Added: TM4C command sender]
+# Sends commands while:
+#   - suppressing exact duplicates
+#   - reducing rapid serial spam/jitter
+#   - allowing force=True for critical commands like STOP and AUTO
 class MotorCommander:
     def __init__(self,ser,min_cmd_interval=0.08):
         self.ser = ser              #serial connection to TM4C
@@ -280,6 +332,7 @@ def open_lidar(port, baud, timeout):
         lid.start_motor()
     except Exception:
         pass
+
     # drain garbage
     try:
         if hasattr(lid, 'clean_input'):
@@ -289,17 +342,18 @@ def open_lidar(port, baud, timeout):
         else:
             try:
                 _ = lid._serial.read(4096)
-            except:
+            except Exception:
                 pass
-    except:
+    except Exception:
         pass
+
     try:
         _ = lid.get_info()
-    except:
+    except Exception:
         pass
     try:
         _ = lid.get_health()
-    except:
+    except Exception:
         pass
     return lid
 
@@ -367,6 +421,48 @@ class LidarState:
 
     def no_data_too_long(self):
         return (time.time() - self.last_valid_time) > self.no_data_stop_sec
+    
+def initialize_lidar():
+    # [SAteefa 3/21 Added: modular LIDAR init so debugging phases can start only what they need]
+    angle_sign = ANGLE_SIGN_D
+    front_deg = FRONT_DEG
+    lidar = open_lidar(LIDAR_PORT, LIDAR_BAUD, LIDAR_TO)
+    scans = iter_scans_standard(lidar)
+    lidar_state = LidarState(angle_sign, front_deg, NO_DATA_STOP_SEC)
+
+    try:
+        _ = next(scans)
+    except Exception:
+        pass
+
+    return lidar, scans, lidar_state
+
+def read_liar_step(lidar, scans, lidar_state):
+    # [SAteefa 3/21 Added: isolated LIDAR read/reopen logic to make failures easier to debug]
+    try:
+        scan = next(scans)
+    except (StopIteration, RPLidarException, OSError) as e:
+        print("[WARN] LIDAR frame issue -> reopen:", e)
+        try:
+            lidar.stop()
+            lidar.stop_motor()
+            lidar.disconnect()
+        except Exception:
+            pass
+
+        time.sleep(0.2)
+        lidar = open_lidar(LIDAR_PORT, LIDAR_BAUD, LIDAR_TO)
+        scans = iter_scans_standard(lidar)
+
+        try:
+            _ = next(scans)
+        except Exception:
+            pass
+
+        return lidar, scans, lidar_state, False
+    
+    lidar_state.update_from_scan(scan)
+    return lidar, scans, lidar_state, True
 
 # =========================
 # Lane / camera helpers
@@ -589,24 +685,86 @@ def open_side_camera(side: str):
     tracker = SimpleLineTracker(w, target_ratio)
     return cap, tracker
 
+def initialize_camera(active_side="LEFT"):
+    # [SAteefa 3/21 Added: modular camera init so camera-only debug can be tested independently]
+    cap, tracker = open_side_camera(active_side)
+    return cap, tracker
+
+def read_camera_step(cap, tracker, active_side):
+    # [SAteefa 3/21 Added: isolated camera read/process logic to make lane debugging cleaner]
+    if cap is None or tracker is None:
+        return None, None, None, None, None, None, None, None, False
+
+    ret, frame = cap.read()
+    if not ret:
+        print(f"[CAM] {active_side}: frame grab failed.")
+        return None, None, None, None, None, None, None, None, False
+
+    if MIRROR_FRAME:
+        frame = cv2.flip(frame, 1)
+
+    out, mask_debug, forward, turn, angle_deg, line_x_bottom, err_norm = process_frame(frame, tracker)
+    lane_visible = (line_x_bottom is not None)
+
+    return frame, out, mask_debug, forward, turn, angle_deg, line_x_bottom, err_norm, lane_visible
+
 # =========================
-# Main integrated state machine
+# Stop sign / pedestrian hooks
+# =========================
+# [SAteefa 3/22 Warning: phase-2 only]
+# These hooks are intentionally added now so the architecture is ready,
+# but detection logic still need edits before use.
+
+def detect_stop_sign(frame):
+    # [SAteefa 3/21 Added: placeholder stop-sign detection hook so the integration architecture is ready before lab tuning]
+    # TODO: replace with actual stop-sign detector
+    return False
+
+
+def detect_pedestrian_blue_dot(frame):
+    # [SAteefa 3/21 Added: placeholder pedestrian blue-dot detection hook]
+    # TODO: replace with actual blue-dot / pedestrian detector
+    return False
+
+class StopEventState:
+    # [SAteefa 3/21 Added: helper state for timed stop-sign holding behavior]
+    def __init__(self):
+        self.active = False
+        self.end_time = 0.0
+
+
+def handle_stop_sign(stop_detected, stop_state, now):
+    # [SAteefa 3/21 Added: placeholder timed stop-sign behavior]
+    if stop_state.active:
+        if now < stop_state.end_time:
+            return True
+        stop_state.active = False
+
+    if stop_detected:
+        stop_state.active = True
+        stop_state.end_time = now + STOP_SIGN_HOLD_SEC
+        return True
+
+    return False
+
+# =========================
+# Boot / cleanup helper functions
 # =========================
 
-def run_integrated():
-    #[SAteefa 3/21 DEBUG Phase 1: To get rid of the bug, there might be another script that is interfering with this one which is inputting garbage; hence garbage output]
+def initialize_system():
+    # [SAteefa 3/21 Added: modular startup helper so all debug phases share the same safe initialization]
     serial_lock = SerialPortLock(SERIAL_LOCK_PATH)
     serial_lock.acquire()
-    atextit.register(serial_lock.release)
-    
+    atexit.register(serial_lock.release)
+
     ser = open_serial()
     mc = MotorCommander(ser)
-
-    #[SAteefa 3/21 Added: startip banner to show which script and hardware ports are active]
+    # [SAteefa 3/21 Added: startup banner to show which script and hardware ports are active]
     print("=" * 60)
     print("[BOOT] camera_part3.py starting")
-    print(f"[BOOT] TM4C port :{PORT}")
-    print(f"[BOOT] LIDAR port: {LIDAR_PORT}")
+    print(f"[BOOT] DEBUG_MODE : {DEBUG_MODE}")
+    print(f"[BOOT] TM4C port  : {PORT}")
+    print(f"[BOOT] LIDAR port : {LIDAR_PORT}")
     print(f"[BOOT] Active side starts on: LEFT")
     print("=" * 60)
 
@@ -614,55 +772,164 @@ def run_integrated():
     time.sleep(0.2)
     mc.send(CMD_AUTO, force=True)
 
-    # LIDAR
-    angle_sign = ANGLE_SIGN_D
-    front_deg  = FRONT_DEG
-    lidar = open_lidar(LIDAR_PORT, LIDAR_BAUD, LIDAR_TO)
-    scans = iter_scans_standard(lidar)
-    lidar_state = LidarState(angle_sign, front_deg, NO_DATA_STOP_SEC)
+    return serial_lock, ser, mc
+
+def cleanup_system(mc=None, cap=None, lidar=None, ser=None, serial_lock=None):
     try:
-        _ = next(scans)
+        if mc is not None:
+            mc.send(STOP_CMD, force=True) #stop the robot before shutting anything down
+    except Exception:
+        pass
+    try:
+        if cap is not None:
+            cap.release() #release the active camera so the device is freed
     except Exception:
         pass
 
-    # Cameras
+    if USE_DISPLAY:
+        cv2.destroyAllWindows() #close any CV display windows
+
+    try:
+        if lidar is not None:
+            lidar.stop()
+            lidar.stop_motor()
+            lidar.disconnect() #safety stop and disconnect the lidar
+    except Exception:
+        pass
+
+    try:
+        if ser is not None:
+            ser.close() #close the TM4c serial connection
+    except Exception:
+        pass
+
+    try:
+        if serial_lock is not None:
+            serial_lock.release() # [SAteefa 3/21 Added: release the serial-port ownership lock so another script can use TM4C later]
+    except Exception:
+        pass
+
+    print("[INFO] Clean exit.") #confirmation that shutdown completed
+
+def show_debug_view(frame, out, mask_debug, active_side, state, cmd, fps):
+    if not USE_DISPLAY or frame is None:
+        return False
+
+    tl_text = f"{active_side} | state={state} cmd={cmd}"
+
+    if SHOW_STACKED_DEBUG and out is not None and mask_debug is not None:
+        h = 300
+        raw_r = cv2.resize(frame, (int(frame.shape[1] * h / frame.shape[0]), h))
+        md_r = cv2.resize(mask_debug, (raw_r.shape[1], h))
+        out_r = cv2.resize(out, (raw_r.shape[1], h))
+        debug_view = np.vstack((np.hstack((raw_r, md_r)), np.hstack((out_r, out_r * 0))))
+        cv2.putText(debug_view, tl_text, (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
+    else:
+        debug_view = out if out is not None else frame.copy()
+        cv2.putText(debug_view, tl_text, (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
+
+    cv2.putText(debug_view, f"FPS: {fps:.1f}", (10, debug_view.shape[0] - 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+    cv2.imshow("Lane Debug", debug_view)
+    key = cv2.waitKey(1) & 0xFF
+    return key == ord('q') or key == 27
+
+# =========================
+# Debug mode runners
+# =========================
+
+def run_camera_only(mc):
+    # [SAteefa 3/21 Added: camera-only phase to verify lane pipeline and TM4C output before full integration]
     active_side = "LEFT"
-    cap, tracker = open_side_camera(active_side)
+    cap, tracker = initialize_camera(active_side)
     if cap is None:
         print("[STATE] Could not open LEFT camera, exiting.")
         return
 
-    state = "CAM_LANE_LEFT"   # starting mode
-    state_start_time = time.time()
-    corridor_origin = None     # 'LEFT' or 'RIGHT' when in middle
-
     lost_frames = 0
-    prev_time   = time.time()
+    prev_time = time.time()
 
     if USE_DISPLAY:
         cv2.namedWindow("Lane Debug", cv2.WINDOW_NORMAL)
 
+    stop_state = StopEventState()
+
     try:
         while True:
-            # ---- LIDAR step ----
-            try:
-                scan = next(scans)
-            except (StopIteration, RPLidarException, OSError) as e:
-                print("[WARN] LIDAR frame issue -> reopen:", e)
-                try:
-                    lidar.stop(); lidar.stop_motor(); lidar.disconnect()
-                except Exception:
-                    pass
-                time.sleep(0.2)
-                lidar = open_lidar(LIDAR_PORT, LIDAR_BAUD, LIDAR_TO)
-                scans = iter_scans_standard(lidar)
-                try:
-                    _ = next(scans)
-                except Exception:
-                    pass
+            frame, out, mask_debug, forward, turn, angle_deg, line_x_bottom, err_norm, lane_visible = read_camera_step(
+                cap, tracker, active_side
+            )
+
+            if frame is None:
+                mc.send(STOP_CMD)
+                print("-> STOP (camera frame failed)")
+                break
+
+            now = time.time()
+            fps = 1.0 / max(1e-6, (now - prev_time))
+            prev_time = now
+
+            if ENABLE_PEDESTRIAN_STOP:
+                ped_seen = detect_pedestrian_blue_dot(frame)
+                if ped_seen:
+                    mc.send(STOP_CMD)
+                    print("-> STOP (pedestrian blue dot)")
+                    if show_debug_view(frame, out, mask_debug, active_side, "CAMERA_ONLY", STOP_CMD, fps):
+                        break
+                    continue
+
+            if ENABLE_STOP_SIGN:
+                stop_seen = detect_stop_sign(frame)
+                if handle_stop_sign(stop_seen, stop_state, now):
+                    mc.send(STOP_CMD)
+                    print("-> STOP (stop sign hold)")
+                    if show_debug_view(frame, out, mask_debug, active_side, "CAMERA_ONLY", STOP_CMD, fps):
+                        break
+                    continue
+
+            if lane_visible:
+                lost_frames = 0
+                if turn > TURN_RIGHT_THRESH:
+                    cmd = CMD_RIGHT
+                elif turn < TURN_LEFT_THRESH:
+                    cmd = CMD_LEFT
+                else:
+                    cmd = CMD_UP
+            else:
+                lost_frames += 1
+                cmd = STOP_CMD if lost_frames >= LOST_FRAMES_THRESH else STOP_CMD
+
+            mc.send(cmd)
+            print(f"-> state=CAMERA_ONLY cmd={cmd}")
+
+            if show_debug_view(frame, out, mask_debug, active_side, "CAMERA_ONLY", cmd, fps):
+                print("[STATE] Quit requested.")
+                break
+
+            if not USE_DISPLAY:
+                time.sleep(0.001)
+
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+
+
+def run_lidar_only(mc):
+    # [SAteefa 3/21 Added: lidar-only phase to verify obstacle thresholds and corridor behavior without camera influence]
+    lidar, scans, lidar_state = initialize_lidar()
+    prev_time = time.time()
+
+    try:
+        while True:
+            lidar, scans, lidar_state, ok = read_lidar_step(lidar, scans, lidar_state)
+            if not ok:
                 continue
 
-            have_any = lidar_state.update_from_scan(scan)
             dL, dC, dR = lidar_state.dL, lidar_state.dC, lidar_state.dR
             dFL, dF, dFR = lidar_state.dFL, lidar_state.dF, lidar_state.dFR
 
@@ -673,26 +940,120 @@ def run_integrated():
             )
 
             if lidar_state.no_data_too_long():
-                mc.send(STOP_CMD)
+                cmd = STOP_CMD
+                mc.send(cmd)
                 print("-> STOP (no LIDAR data)")
                 time.sleep(0.05)
                 continue
 
-            # Near obstacle override: immediate back up
             if min(dL, dC, dR) < NEAR_OBS_TRIP:
-                mc.send(CMD_DOWN)
+                cmd = CMD_DOWN
+                mc.send(cmd)
                 print("-> BACKOFF (NEAR obstacle)")
                 time.sleep(0.05)
                 continue
 
-            # Side open/blocked
             openL = dL >= THRESH_MAIN
             openC = dC >= THRESH_MAIN
             openR = dR >= THRESH_MAIN
-            left_blocked  = not openL
-            right_blocked = not openR
 
-            # ---- Camera handling ----
+            if (not openL) and (not openR):
+                if math.isinf(dL) or math.isinf(dR):
+                    cmd = STOP_CMD
+                else:
+                    diff = dL - dR
+                    if abs(diff) <= CORRIDOR_BALANCE_EPS_MM and openC:
+                        cmd = CMD_UP
+                    elif diff > CORRIDOR_BALANCE_EPS_MM:
+                        cmd = CMD_LEFT
+                    elif diff < -CORRIDOR_BALANCE_EPS_MM:
+                        cmd = CMD_RIGHT
+                    else:
+                        cmd = CMD_UP
+            else:
+                if not openC:
+                    cmd = STOP_CMD
+                elif openL and not openR:
+                    cmd = CMD_LEFT
+                elif openR and not openL:
+                    cmd = CMD_RIGHT
+                else:
+                    cmd = CMD_UP
+
+            mc.send(cmd)
+            print(f"-> state=LIDAR_ONLY cmd={cmd}")
+            time.sleep(0.02)
+
+    finally:
+        try:
+            lidar.stop()
+            lidar.stop_motor()
+            lidar.disconnect()
+        except Exception:
+            pass
+
+# =========================
+# Full integrated state machine
+# =========================
+
+# [SAteefa 3/22 Added: main integrated control loop]
+# This function is the single owner of TM4C output.
+# It combines:
+#   - serial/TM4C setup
+#   - lidar updates
+#   - camera lane detection
+#   - state-machine transitions
+#   - final motor command selection
+#
+# Because this script is the integrated controller, no additional
+# driving script should write to the TM4C serial port at the same time.
+
+
+def run_full_integrated(mc):
+    # [SAteefa 3/21 Added: full integration mode after camera-only and lidar-only paths are verified independently]
+    lidar, scans, lidar_state = initialize_lidar()
+
+    active_side = "LEFT"
+    cap, tracker = initialize_camera(active_side)
+    if cap is None:
+        print("[STATE] Could not open LEFT camera, exiting.")
+        return lidar, None
+
+    state = "CAM_LANE_LEFT"
+    state_start_time = time.time()
+    corridor_origin = None
+
+    lost_frames = 0
+    prev_time = time.time()
+    stop_state = StopEventState()
+
+    if USE_DISPLAY:
+        cv2.namedWindow("Lane Debug", cv2.WINDOW_NORMAL)
+
+    # [SAteefa 3/22 Added: command priority order]
+        # Highest priority safety overrides should win in this order:
+        # 1. pedestrian stop
+        # 2. stop-sign stop/hold
+        # 3. near-obstacle backoff
+        # 4. no-lidar-data stop
+        # 5. lidar corridor / obstacle state logic
+        # 6. normal camera lane-following
+        
+    try:
+        while True:
+            lidar, scans, lidar_state, ok = read_lidar_step(lidar, scans, lidar_state)
+            if not ok:
+                continue
+
+            dL, dC, dR = lidar_state.dL, lidar_state.dC, lidar_state.dR
+            dFL, dF, dFR = lidar_state.dFL, lidar_state.dF, lidar_state.dFR
+
+            print(
+                f"L={fmt_mm(dL)}  C={fmt_mm(dC)}  R={fmt_mm(dR)}"
+                f"  |  FL={fmt_mm(dFL)}  F={fmt_mm(dF)}  FR={fmt_mm(dFR)}",
+                end="  "
+            )
+
             frame = None
             out = None
             mask_debug = None
@@ -703,50 +1064,82 @@ def run_integrated():
             err_norm = 0.0
             lane_visible = False
 
-            cam_state_uses_camera = state.startswith("CAM_LANE") or \
-                                    state.startswith("CHANGE_ALIGN") or \
-                                    state.startswith("ALIGN_AFTER_CORRIDOR")
+            cam_state_uses_camera = (
+                state.startswith("CAM_LANE") or
+                state.startswith("CHANGE_ALIGN") or
+                state.startswith("ALIGN_AFTER_CORRIDOR")
+            )
 
             if cam_state_uses_camera:
-                if cap is None or tracker is None:
-                    print(f"[STATE] {state}: camera/tracker missing, stopping.")
-                    mc.send(STOP_CMD)
-                    break
+                frame, out, mask_debug, forward, turn, angle_deg, line_x_bottom, err_norm, lane_visible = read_camera_step(
+                    cap, tracker, active_side
+                )
 
-                ret, frame = cap.read()
-                if not ret:
+                if frame is None:
                     print(f"[CAM] {active_side}: frame grab failed, stopping.")
                     mc.send(STOP_CMD)
                     break
-
-                if MIRROR_FRAME:
-                    frame = cv2.flip(frame, 1)
-
-                out, mask_debug, forward, turn, angle_deg, line_x_bottom, err_norm = process_frame(frame, tracker)
-                lane_visible = (line_x_bottom is not None)
 
                 if lane_visible:
                     lost_frames = 0
                 else:
                     lost_frames += 1
             else:
-                # No camera in this state
                 lost_frames = 0
 
             now = time.time()
             fps = 1.0 / max(1e-6, (now - prev_time))
             prev_time = now
 
-            cmd = STOP_CMD  # default each iteration
+            if ENABLE_PEDESTRIAN_STOP and frame is not None:
+                ped_seen = detect_pedestrian_blue_dot(frame)
+                if ped_seen:
+                    cmd = STOP_CMD
+                    mc.send(cmd)
+                    print("-> STOP (pedestrian blue dot)")
+                    if show_debug_view(frame, out, mask_debug, active_side, state, cmd, fps):
+                        print("[STATE] Quit requested.")
+                        break
+                    continue
+
+            if ENABLE_STOP_SIGN and frame is not None:
+                stop_seen = detect_stop_sign(frame)
+                if handle_stop_sign(stop_seen, stop_state, now):
+                    cmd = STOP_CMD
+                    mc.send(cmd)
+                    print("-> STOP (stop sign hold)")
+                    if show_debug_view(frame, out, mask_debug, active_side, state, cmd, fps):
+                        print("[STATE] Quit requested.")
+                        break
+                    continue
+
+            if lidar_state.no_data_too_long():
+                cmd = STOP_CMD
+                mc.send(cmd)
+                print("-> STOP (no LIDAR data)")
+                time.sleep(0.05)
+                continue
+
+            if min(dL, dC, dR) < NEAR_OBS_TRIP:
+                cmd = CMD_DOWN
+                mc.send(cmd)
+                print("-> BACKOFF (NEAR obstacle)")
+                time.sleep(0.05)
+                continue
+
+            openL = dL >= THRESH_MAIN
+            openC = dC >= THRESH_MAIN
+            openR = dR >= THRESH_MAIN
+            left_blocked = not openL
+            right_blocked = not openR
+
+            cmd = STOP_CMD
 
             # ===== STATE MACHINE =====
 
-            # 1) Corridor detection (both sides blocked) -> LIDAR-only mode
             if left_blocked and right_blocked and not state.startswith("LIDAR_MIDDLE"):
-                # Enter corridor from current "origin"
                 corridor_origin = "LEFT" if active_side == "LEFT" else "RIGHT"
                 print(f"[STATE] Entering LIDAR_MIDDLE from {corridor_origin}")
-                # Turn off any camera
                 if cap is not None:
                     cap.release()
                     cap = None
@@ -754,27 +1147,20 @@ def run_integrated():
                 state = "LIDAR_MIDDLE_BALANCE"
                 state_start_time = now
 
-            # ----- LIDAR middle corridor states -----
             if state == "LIDAR_MIDDLE_BALANCE":
-                # Try to center between left/right obstacles
                 if math.isinf(dL) or math.isinf(dR):
-                    # Not enough info, just stop for safety
                     cmd = STOP_CMD
                 else:
-                    diff = dL - dR  # >0: farther from left, closer to right
+                    diff = dL - dR
                     if abs(diff) <= CORRIDOR_BALANCE_EPS_MM and openC:
-                        # Centered enough -> next phase
                         print("[STATE] Balanced in middle -> LIDAR_MIDDLE_FORWARD")
                         state = "LIDAR_MIDDLE_FORWARD"
                         state_start_time = now
                         cmd = CMD_UP
                     else:
-                        # Move away from closer side
                         if diff > CORRIDOR_BALANCE_EPS_MM:
-                            # closer to right -> steer left
                             cmd = CMD_LEFT
                         elif diff < -CORRIDOR_BALANCE_EPS_MM:
-                            # closer to left -> steer right
                             cmd = CMD_RIGHT
                         else:
                             cmd = CMD_UP
@@ -782,10 +1168,8 @@ def run_integrated():
             elif state == "LIDAR_MIDDLE_FORWARD":
                 elapsed = now - state_start_time
                 if elapsed < CORRIDOR_FORWARD_TIME and openC:
-                    # just go forward down the middle
                     cmd = CMD_UP
                 else:
-                    # corridor forward complete or blocked; go to exit turn
                     print(f"[STATE] LIDAR_MIDDLE_FORWARD done ({elapsed:.2f}s) -> LIDAR_MIDDLE_EXIT_TURN")
                     state = "LIDAR_MIDDLE_EXIT_TURN"
                     state_start_time = now
@@ -797,11 +1181,10 @@ def run_integrated():
                 if elapsed < CORRIDOR_EXIT_TURN_TIME:
                     cmd = exit_cmd
                 else:
-                    # Done turning, open camera for origin side and align
                     side = corridor_origin
                     print(f"[STATE] LIDAR_MIDDLE_EXIT complete -> ALIGN_AFTER_CORRIDOR_{side}")
                     active_side = side
-                    cap, tracker = open_side_camera(active_side)
+                    cap, tracker = initialize_camera(active_side)
                     if cap is None:
                         print(f"[STATE] Could not open {active_side} camera after corridor, stopping.")
                         mc.send(STOP_CMD)
@@ -810,12 +1193,9 @@ def run_integrated():
                     state_start_time = now
                     cmd = CMD_UP
 
-            # ----- Align after corridor (camera on) -----
-            elif state == "ALIGN_AFTER_CORRIDOR_LEFT" or state == "ALIGN_AFTER_CORRIDOR_RIGHT":
+            elif state in ("ALIGN_AFTER_CORRIDOR_LEFT", "ALIGN_AFTER_CORRIDOR_RIGHT"):
                 if lane_visible:
-                    # We ignore the sign of turn; go straight until |turn| ~ 0
                     if abs(turn) <= ALIGN_TURN_EPS:
-                        # Aligned: enter normal lane mode
                         if "LEFT" in state:
                             print("[STATE] ALIGN_AFTER_CORRIDOR_LEFT complete -> CAM_LANE_LEFT")
                             state = "CAM_LANE_LEFT"
@@ -827,20 +1207,16 @@ def run_integrated():
                     else:
                         cmd = CMD_UP
                 else:
-                    # lane not visible yet -> still go forward
                     cmd = CMD_UP
 
-            # ----- Lane-change: L2R turn phase -----
             elif state == "CHANGE_L2R_TURN":
                 elapsed = now - state_start_time
-                # During this turn, still check corridor: handled above
                 if elapsed < LANE_CHANGE_TURN_TIME:
                     cmd = CMD_RIGHT
                 else:
-                    # Done initial turn, open RIGHT camera and go to align phase
                     print("[STATE] CHANGE_L2R_TURN done -> CHANGE_ALIGN_TO_RIGHT")
                     active_side = "RIGHT"
-                    cap, tracker = open_side_camera(active_side)
+                    cap, tracker = initialize_camera(active_side)
                     if cap is None:
                         print("[STATE] Could not open RIGHT camera for change, stopping.")
                         mc.send(STOP_CMD)
@@ -849,7 +1225,6 @@ def run_integrated():
                     state_start_time = now
                     cmd = CMD_UP
 
-            # ----- Lane-change: R2L turn phase -----
             elif state == "CHANGE_R2L_TURN":
                 elapsed = now - state_start_time
                 if elapsed < LANE_CHANGE_TURN_TIME:
@@ -857,7 +1232,7 @@ def run_integrated():
                 else:
                     print("[STATE] CHANGE_R2L_TURN done -> CHANGE_ALIGN_TO_LEFT")
                     active_side = "LEFT"
-                    cap, tracker = open_side_camera(active_side)
+                    cap, tracker = initialize_camera(active_side)
                     if cap is None:
                         print("[STATE] Could not open LEFT camera for change, stopping.")
                         mc.send(STOP_CMD)
@@ -866,11 +1241,9 @@ def run_integrated():
                     state_start_time = now
                     cmd = CMD_UP
 
-            # ----- Align after lane-change -----
-            elif state == "CHANGE_ALIGN_TO_RIGHT" or state == "CHANGE_ALIGN_TO_LEFT":
+            elif state in ("CHANGE_ALIGN_TO_RIGHT", "CHANGE_ALIGN_TO_LEFT"):
                 if lane_visible:
                     if abs(turn) <= ALIGN_TURN_EPS:
-                        # Done aligning, return to normal lane mode
                         if "RIGHT" in state:
                             print("[STATE] CHANGE_ALIGN_TO_RIGHT complete -> CAM_LANE_RIGHT")
                             state = "CAM_LANE_RIGHT"
@@ -880,21 +1253,15 @@ def run_integrated():
                         state_start_time = now
                         cmd = CMD_UP
                     else:
-                        # Still aligning: just go forward
                         cmd = CMD_UP
                 else:
                     cmd = CMD_UP
 
-            # ----- Normal lane-follow states -----
-            elif state == "CAM_LANE_LEFT" or state == "CAM_LANE_RIGHT":
-                # Lane-loss simple behavior: if lost for too long, stop
+            elif state in ("CAM_LANE_LEFT", "CAM_LANE_RIGHT"):
                 if lane_visible:
-                    # Check for case 1 / case 3: obstacle on current side only
                     if state == "CAM_LANE_LEFT":
                         if left_blocked and not right_blocked:
-                            # Case 1: obstacle on left, right is open
                             print("[STATE] Obstacle on LEFT side -> CHANGE_L2R_TURN")
-                            # Turn off left camera
                             if cap is not None:
                                 cap.release()
                                 cap = None
@@ -903,16 +1270,14 @@ def run_integrated():
                             state_start_time = now
                             cmd = CMD_RIGHT
                         else:
-                            # No special obstacle case -> standard lane-follow
                             if turn > TURN_RIGHT_THRESH:
                                 cmd = CMD_RIGHT
                             elif turn < TURN_LEFT_THRESH:
                                 cmd = CMD_LEFT
                             else:
                                 cmd = CMD_UP
-                    else:  # CAM_LANE_RIGHT
+                    else:
                         if right_blocked and not left_blocked:
-                            # Case 3: obstacle on right, left is open
                             print("[STATE] Obstacle on RIGHT side -> CHANGE_R2L_TURN")
                             if cap is not None:
                                 cap.release()
@@ -929,7 +1294,6 @@ def run_integrated():
                             else:
                                 cmd = CMD_UP
                 else:
-                    # Lane temporarily missing
                     if lost_frames >= LOST_FRAMES_THRESH:
                         print(f"[STATE] Lane lost in {state} for {lost_frames} frames -> STOP")
                         cmd = STOP_CMD
@@ -937,65 +1301,54 @@ def run_integrated():
                         cmd = STOP_CMD
 
             else:
-                # Unknown state -> safe stop
                 print(f"[STATE] Unknown state '{state}', stopping.")
                 cmd = STOP_CMD
 
             mc.send(cmd)
             print(f"-> state={state} cmd={cmd}")
 
-            # Display if enabled
-            if USE_DISPLAY and frame is not None:
-                tl_text = f"{active_side} | state={state} cmd={cmd}"
-                if SHOW_STACKED_DEBUG and out is not None and mask_debug is not None:
-                    # simple 2x2 debug view
-                    h = 300
-                    raw_r = cv2.resize(frame, (int(frame.shape[1]*h/frame.shape[0]), h))
-                    md_r  = cv2.resize(mask_debug, (raw_r.shape[1], h))
-                    out_r = cv2.resize(out, (raw_r.shape[1], h))
-                    debug_view = np.vstack((np.hstack((raw_r, md_r)), np.hstack((out_r, out_r*0))))
-                    cv2.putText(debug_view, tl_text, (10, 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50,255,50), 2)
-                else:
-                    debug_view = out if out is not None else frame.copy()
-                    cv2.putText(debug_view, tl_text, (10, 24),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50,255,50), 2)
-                cv2.putText(debug_view, f"FPS: {fps:.1f}", (10, debug_view.shape[0]-16),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            if show_debug_view(frame, out, mask_debug, active_side, state, cmd, fps):
+                print("[STATE] Quit requested.")
+                break
 
-                cv2.imshow("Lane Debug", debug_view)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == 27:
-                    print("[STATE] Quit requested.")
-                    break
-            else:
+            if not USE_DISPLAY:
                 time.sleep(0.001)
 
     finally:
         try:
-            mc.send(STOP_CMD) #stop the robot before shutting anything down
-        except Exception:
-            pass
-        try:
             if cap is not None:
-                cap.release() #release the active camera so the device is freed
+                cap.release()
         except Exception:
             pass
-        if USE_DISPLAY:
-            cv2.destroyAllWindows() #close any OpenCV display windows
-        try:
-            lidar.stop(); lidar.stop_motor(); lidar.disconnect() #safely stop and disconnect the lidar
-        except Exception:
-            pass
-        try:
-            ser.close() #close the TM4C serial connection
-        except Exception:
-            pass
-        try:
-            serial_lock.release() #[SATEEFA 3/21] new: release the serial-port ownership lock so another script can use TM4c later
-        except Exception:
-            pass
-        print("[INFO] Clean exit.") # confirmation that shutdown completed
+
+    return lidar, cap
+
+# =========================
+# Main entry point
+# =========================
+
+def run_integrated():
+    serial_lock = None
+    ser = None
+    mc = None
+    lidar = None
+    cap = None
+
+    try:
+        serial_lock, ser, mc = initialize_system()
+
+        if DEBUG_MODE == "CAMERA_ONLY":
+            run_camera_only(mc)
+
+        elif DEBUG_MODE == "LIDAR_ONLY":
+            run_lidar_only(mc)
+
+        else:
+            lidar, cap = run_full_integrated(mc)
+
+    finally:
+        cleanup_system(mc=mc, cap=cap, lidar=lidar, ser=ser, serial_lock=serial_lock)
+
 
 if __name__ == "__main__":
     run_integrated()
