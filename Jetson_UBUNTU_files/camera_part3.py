@@ -52,7 +52,7 @@ import os
 import sys
 import fcntl
 import atexit
-
+import signal
 # =========================
 # Debug / integration toggles
 # =========================
@@ -68,6 +68,11 @@ DEBUG_MODE = "CAMERA_ONLY" #CAMERA_ONLY, LIDAR_ONLY, FULL
 # but they should remain disabled during base camera/lidar debugging until separately tested.
 ENABLE_STOP_SIGN = False
 ENABLE_PEDESTRIAN_STOP = False
+
+
+GLOBAL_MC = None
+GLOBAL_SERIAL_LOCK = None
+GLOBAL_SER = None
 
 # =========================
 # Serial / driving config
@@ -91,8 +96,15 @@ CMD_MANUAL = "Manual"
 STOP_CMD   = "Stop"
 
 # For deciding steering commands from lane PD output
-TURN_LEFT_THRESH  = -0.20
-TURN_RIGHT_THRESH =  0.20
+#TURN_LEFT_THRESH  = -0.20
+#TURN_RIGHT_THRESH =  0.20
+
+##new to avoid wheel spasm:
+# [SAteefa 3/22 Added: hysteresis thresholds to reduce left/right command chatter]
+LEFT_ENTER_THRESH  = -0.24
+LEFT_EXIT_THRESH   = -0.12
+RIGHT_ENTER_THRESH =  0.24
+RIGHT_EXIT_THRESH  =  0.12
 
 # =========================
 # LIDAR config / thresholds
@@ -156,20 +168,25 @@ Y_MIN = 160
 CR_ABS_MAX = 14
 CB_ABS_MAX = 14
 
-USE_OTSU_BACKUP = True
+USE_OTSU_BACKUP = False
 OTSU_RATIO = 0.60
 
 OPEN_K  = (3, 3)
 CLOSE_K = (11, 11)
 
-MIN_AREA             = 300
-MIN_HEIGHT           = 40
-MIN_WIDTH            = 4
-MIN_ASPECT_H_OVER_W  = 1.2
+MIN_AREA             = 80 #old: 100
+MIN_HEIGHT           = 15 #old: 20
+MIN_WIDTH            = 2
+MIN_ASPECT_H_OVER_W  = 0.6 #old: 1.0
 ANGLE_TOL_DEG        = 90
 
-TARGET_X_RATIO_LEFT  = 0.43
-TARGET_X_RATIO_RIGHT = 0.65
+
+#### changing ratios to avoid spasing
+#TARGET_X_RATIO_LEFT  = 0.43
+#TARGET_X_RATIO_RIGHT = 0.65
+
+TARGET_X_RATIO_LEFT = 0.32
+TARGET_X_RATIO_RIGHT = 0.68
 
 # PD gains
 Kp = 0.9
@@ -185,6 +202,7 @@ MIRROR_FRAME = False
 
 USE_DISPLAY        = False
 SHOW_STACKED_DEBUG = False
+SAVE_DEBUG_IMAGES = True
 
 LEFT_CAM_INDEX  = 2
 RIGHT_CAM_INDEX = 0
@@ -298,19 +316,24 @@ class MotorCommander:
         self.last_cmd = None        #remembers the last command sent
         self.last_send_time = 0.0   # [SAteefa 3/21 added: remembers when the last command was sent]
         self.min_cmd_interval = min_cmd_interval # [SAteefa 3/21 added: minimum delay between non-forced command sends]
-    def send(self, cmd:str, force:bool=False):  # [SAteefa 3/21 added: allow critcal commands to bypass any duplication/timing suppression]
+    def send(self, cmd:str, force:bool=False):
         now = time.time()
 
-        should_send = force or (cmd != self.last_cmd)  # [SAteefa 3/21 added: only send changed commands unless force=True]
-        if not should_send:
-            return  #skip duplicate command
-        
-        if not force and (now - self.last_send_time) < self.min_cmd_interval: # [SAteefa 3/21 added: throttle rapid back-to-back command sends to reduce serial spam/jitter]
+        same_cmd = (cmd == self.last_cmd)
+        too_soon = (now - self.last_send_time) < self.min_cmd_interval
+
+        # send immediately if forced
+        if force:
+            send_line_typewriter(self.ser, cmd)
+            self.last_cmd = cmd
+            self.last_send_time = now
             return
-        
-        send_line_typewriter(self.ser,cmd) #transmit command to TM4c
-        self.last_cmd = cmd
-        self.last_send_time = now # [SAteefa 3/21 added: update timestamp after successful transmission]
+
+        # send if command changed, or if same command but refresh interval has passed
+        if (not same_cmd) or (not too_soon):
+            send_line_typewriter(self.ser, cmd)
+            self.last_cmd = cmd
+            self.last_send_time = now
 
 # =========================
 # LIDAR helpers
@@ -437,33 +460,6 @@ def initialize_lidar():
 
     return lidar, scans, lidar_state
 
-def read_liar_step(lidar, scans, lidar_state):
-    # [SAteefa 3/21 Added: isolated LIDAR read/reopen logic to make failures easier to debug]
-    try:
-        scan = next(scans)
-    except (StopIteration, RPLidarException, OSError) as e:
-        print("[WARN] LIDAR frame issue -> reopen:", e)
-        try:
-            lidar.stop()
-            lidar.stop_motor()
-            lidar.disconnect()
-        except Exception:
-            pass
-
-        time.sleep(0.2)
-        lidar = open_lidar(LIDAR_PORT, LIDAR_BAUD, LIDAR_TO)
-        scans = iter_scans_standard(lidar)
-
-        try:
-            _ = next(scans)
-        except Exception:
-            pass
-
-        return lidar, scans, lidar_state, False
-    
-    lidar_state.update_from_scan(scan)
-    return lidar, scans, lidar_state, True
-
 # =========================
 # Lane / camera helpers
 # =========================
@@ -567,6 +563,28 @@ def apply_steering(norm_error):
     print(f"[CTRL] forward={forward:.2f} turn={turn:.2f}")
     return forward, turn
 
+# [SAteefa 3/22 Added: hysteresis-based discrete steering decision]
+# Keeps the controller from flipping between LEFT and FORWARD on tiny frame-to-frame noise.
+def choose_cmd_with_hysteresis(turn, steer_state):
+    if steer_state == "LEFT":
+        if turn > LEFT_EXIT_THRESH:
+            steer_state = "STRAIGHT"
+    elif steer_state == "RIGHT":
+        if turn < RIGHT_EXIT_THRESH:
+            steer_state = "STRAIGHT"
+    else:
+        if turn < LEFT_ENTER_THRESH:
+            steer_state = "LEFT"
+        elif turn > RIGHT_ENTER_THRESH:
+            steer_state = "RIGHT"
+
+    if steer_state == "LEFT":
+        return CMD_LEFT, steer_state
+    elif steer_state == "RIGHT":
+        return CMD_RIGHT, steer_state
+    else:
+        return CMD_UP, steer_state
+
 def process_frame(frame_bgr, tracker: SimpleLineTracker):
     h, w = frame_bgr.shape[:2]
     y_bottom = h - 1
@@ -627,6 +645,12 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker):
     forward, turn = apply_steering(u)
 
     print(f"[TELEM] LineX={line_x_bottom}  ErrNorm={err_norm:+.2f}  AngleAbsDeg={angle_deg}")
+    if SAVE_DEBUG_IMAGES:
+        cv2.imwrite("output_mask.jpg", mask_white)
+        cv2.imwrite("output.jpg", out)
+        cv2.imwrite("input.jpg", frame_bgr)
+        cv2.imwrite("mask.jpg", mask_debug)
+
 
     return out, mask_debug, forward, turn, (angle_deg if angle_deg is not None else 0.0), line_x_bottom, err_norm
 
@@ -751,6 +775,30 @@ def handle_stop_sign(stop_detected, stop_state, now):
 # Boot / cleanup helper functions
 # =========================
 
+def emergency_shutdown(signum, frame):
+    print(f"\n[SIGNAL] Caught signal {signum}, attempting safe stop...")
+
+    try:
+        if GLOBAL_MC is not None:
+            GLOBAL_MC.send(STOP_CMD, force=True)
+            time.sleep(0.2)
+    except Exception as e:
+        print("[SIGNAL] Failed to send stop:", e)
+
+    try:
+        if GLOBAL_SER is not None:
+            GLOBAL_SER.close()
+    except Exception:
+        pass
+
+    try:
+        if GLOBAL_SERIAL_LOCK is not None:
+            GLOBAL_SERIAL_LOCK.release()
+    except Exception:
+        pass
+
+    raise SystemExit(0)
+
 def initialize_system():
     # [SAteefa 3/21 Added: modular startup helper so all debug phases share the same safe initialization]
     serial_lock = SerialPortLock(SERIAL_LOCK_PATH)
@@ -759,6 +807,17 @@ def initialize_system():
 
     ser = open_serial()
     mc = MotorCommander(ser)
+
+    global GLOBAL_MC, GLOBAL_SERIAL_LOCK, GLOBAL_SER
+    GLOBAL_MC = mc
+    GLOBAL_SERIAL_LOCK = serial_lock
+    GLOBAL_SER = ser
+
+    signal.signal(signal.SIGINT, emergency_shutdown)   # Ctrl+C
+    signal.signal(signal.SIGTERM, emergency_shutdown)  # kill
+    signal.signal(signal.SIGTSTP, emergency_shutdown)  # Ctrl+Z
+
+
     # [SAteefa 3/21 Added: startup banner to show which script and hardware ports are active]
     print("=" * 60)
     print("[BOOT] camera_part3.py starting")
@@ -787,8 +846,11 @@ def cleanup_system(mc=None, cap=None, lidar=None, ser=None, serial_lock=None):
         pass
 
     if USE_DISPLAY:
-        cv2.destroyAllWindows() #close any CV display windows
-
+        try:
+            cv2.namedWindow("Lane Debug", cv2.WINDOW_NORMAL)
+        except cv2.error as e:
+            print("[WARN] OpenCV display unavailable, disabling USE_DISPLAY:", e)
+            globals()["USE_DISPLAY"] = False
     try:
         if lidar is not None:
             lidar.stop()
@@ -842,6 +904,7 @@ def show_debug_view(frame, out, mask_debug, active_side, state, cmd, fps):
 # =========================
 
 def run_camera_only(mc):
+
     # [SAteefa 3/21 Added: camera-only phase to verify lane pipeline and TM4C output before full integration]
     active_side = "LEFT"
     cap, tracker = initialize_camera(active_side)
@@ -851,11 +914,14 @@ def run_camera_only(mc):
 
     lost_frames = 0
     prev_time = time.time()
+    steer_state = "STRAIGHT"   # [SAteefa 3/26 Added: remembers current steering mode for hysteresis]
+
 
     if USE_DISPLAY:
         cv2.namedWindow("Lane Debug", cv2.WINDOW_NORMAL)
 
     stop_state = StopEventState()
+
 
     try:
         while True:
@@ -892,12 +958,7 @@ def run_camera_only(mc):
 
             if lane_visible:
                 lost_frames = 0
-                if turn > TURN_RIGHT_THRESH:
-                    cmd = CMD_RIGHT
-                elif turn < TURN_LEFT_THRESH:
-                    cmd = CMD_LEFT
-                else:
-                    cmd = CMD_UP
+                cmd, steer_state = choose_cmd_with_hysteresis(turn, steer_state)
             else:
                 lost_frames += 1
                 cmd = STOP_CMD if lost_frames >= LOST_FRAMES_THRESH else STOP_CMD
@@ -1008,6 +1069,33 @@ def run_lidar_only(mc):
 # Because this script is the integrated controller, no additional
 # driving script should write to the TM4C serial port at the same time.
 
+def read_lidar_step(lidar, scans, lidar_state):
+    # [SAteefa 3/21 Added: isolated LIDAR read/reopen logic to make failures easier to debug]
+    try:
+        scan = next(scans)
+    except (StopIteration, RPLidarException, OSError) as e:
+        print("[WARN] LIDAR frame issue -> reopen:", e)
+        try:
+            lidar.stop()
+            lidar.stop_motor()
+            lidar.disconnect()
+        except Exception:
+            pass
+
+        time.sleep(0.2)
+        lidar = open_lidar(LIDAR_PORT, LIDAR_BAUD, LIDAR_TO)
+        scans = iter_scans_standard(lidar)
+
+        try:
+            _ = next(scans)
+        except Exception:
+            pass
+
+        return lidar, scans, lidar_state, False
+
+    lidar_state.update_from_scan(scan)
+    return lidar, scans, lidar_state, True
+
 
 def run_full_integrated(mc):
     # [SAteefa 3/21 Added: full integration mode after camera-only and lidar-only paths are verified independently]
@@ -1038,7 +1126,12 @@ def run_full_integrated(mc):
         # 4. no-lidar-data stop
         # 5. lidar corridor / obstacle state logic
         # 6. normal camera lane-following
-        
+
+    lost_frames = 0
+    prev_time = time.time()
+    stop_state = StopEventState()
+    steer_state = "STRAIGHT"   # [SAteefa 3/22 Added: remembers current steering mode for hysteresis]
+            
     try:
         while True:
             lidar, scans, lidar_state, ok = read_lidar_step(lidar, scans, lidar_state)
@@ -1144,6 +1237,7 @@ def run_full_integrated(mc):
                     cap.release()
                     cap = None
                     tracker = None
+                steer_state = "STRAIGHT"   # reset steering memory before corridor mode
                 state = "LIDAR_MIDDLE_BALANCE"
                 state_start_time = now
 
@@ -1202,6 +1296,7 @@ def run_full_integrated(mc):
                         else:
                             print("[STATE] ALIGN_AFTER_CORRIDOR_RIGHT complete -> CAM_LANE_RIGHT")
                             state = "CAM_LANE_RIGHT"
+                        steer_state = "STRAIGHT"   # restart lane-following with clean steering memory
                         state_start_time = now
                         cmd = CMD_UP
                     else:
@@ -1250,6 +1345,7 @@ def run_full_integrated(mc):
                         else:
                             print("[STATE] CHANGE_ALIGN_TO_LEFT complete -> CAM_LANE_LEFT")
                             state = "CAM_LANE_LEFT"
+                        steer_state = "STRAIGHT"   # restart lane-following with clean steering memory
                         state_start_time = now
                         cmd = CMD_UP
                     else:
@@ -1266,16 +1362,12 @@ def run_full_integrated(mc):
                                 cap.release()
                                 cap = None
                                 tracker = None
+                            steer_state = "STRAIGHT"   # reset steering memory before lane-change turn
                             state = "CHANGE_L2R_TURN"
                             state_start_time = now
                             cmd = CMD_RIGHT
                         else:
-                            if turn > TURN_RIGHT_THRESH:
-                                cmd = CMD_RIGHT
-                            elif turn < TURN_LEFT_THRESH:
-                                cmd = CMD_LEFT
-                            else:
-                                cmd = CMD_UP
+                            cmd, steer_state = choose_cmd_with_hysteresis(turn, steer_state)
                     else:
                         if right_blocked and not left_blocked:
                             print("[STATE] Obstacle on RIGHT side -> CHANGE_R2L_TURN")
@@ -1283,19 +1375,16 @@ def run_full_integrated(mc):
                                 cap.release()
                                 cap = None
                                 tracker = None
+                            steer_state = "STRAIGHT" #reset steering memory before lane-change turn
                             state = "CHANGE_R2L_TURN"
                             state_start_time = now
                             cmd = CMD_LEFT
                         else:
-                            if turn > TURN_RIGHT_THRESH:
-                                cmd = CMD_RIGHT
-                            elif turn < TURN_LEFT_THRESH:
-                                cmd = CMD_LEFT
-                            else:
-                                cmd = CMD_UP
+                            cmd, steer_state = choose_cmd_with_hysteresis(turn, steer_state)
                 else:
                     if lost_frames >= LOST_FRAMES_THRESH:
                         print(f"[STATE] Lane lost in {state} for {lost_frames} frames -> STOP")
+                        steer_state = "STRAIGHT"   # do not keep old steering bias after lane loss
                         cmd = STOP_CMD
                     else:
                         cmd = STOP_CMD
