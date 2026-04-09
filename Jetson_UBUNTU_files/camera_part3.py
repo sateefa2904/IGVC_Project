@@ -185,7 +185,7 @@ ANGLE_TOL_DEG        = 90
 #TARGET_X_RATIO_LEFT  = 0.43
 #TARGET_X_RATIO_RIGHT = 0.65
 
-TARGET_X_RATIO_LEFT = 0.32
+TARGET_X_RATIO_LEFT = 0.40
 TARGET_X_RATIO_RIGHT = 0.68
 
 # PD gains
@@ -546,10 +546,10 @@ class SimpleLineTracker:
         target_x = self.target_x_ratio * self.w
 
         if line_x_bottom is None:
-            err_norm = 0.0
-        else:
-            err_px = line_x_bottom - target_x
-            err_norm = float(np.clip(err_px / (self.w/2), -1.0, 1.0))
+            return None, None
+
+        err_px = line_x_bottom - target_x
+        err_norm = float(np.clip(err_px / (self.w/2), -1.0, 1.0))
 
         d = err_norm - self.prev_err
         self.prev_err = err_norm
@@ -557,36 +557,56 @@ class SimpleLineTracker:
         u = float(np.clip(u, -1.0, 1.0))
         return u, err_norm
 
-def apply_steering(norm_error):
-    turn = float(np.clip(norm_error, -1.0, 1.0)) * TEST_TURN_SCALE
-    forward = 0.6 * (1 - 0.5*abs(turn))
-    print(f"[CTRL] forward={forward:.2f} turn={turn:.2f}")
-    return forward, turn
+    def apply_steering(norm_error):
+        turn = float(np.clip(norm_error, -1.0, 1.0)) * TEST_TURN_SCALE
+        forward = 0.6 * (1 - 0.5*abs(turn))
+        print(f"[CTRL] forward={forward:.2f} turn={turn:.2f}")
+        return forward, turn
 
-# [SAteefa 3/22 Added: hysteresis-based discrete steering decision]
-# Keeps the controller from flipping between LEFT and FORWARD on tiny frame-to-frame noise.
-def choose_cmd_with_hysteresis(turn, steer_state):
-    if steer_state == "LEFT":
-        if turn > LEFT_EXIT_THRESH:
-            steer_state = "STRAIGHT"
-    elif steer_state == "RIGHT":
-        if turn < RIGHT_EXIT_THRESH:
-            steer_state = "STRAIGHT"
-    else:
-        if turn < LEFT_ENTER_THRESH:
-            steer_state = "LEFT"
-        elif turn > RIGHT_ENTER_THRESH:
-            steer_state = "RIGHT"
+    # [SAteefa 3/22 Added: hysteresis-based discrete steering decision]
+    # Keeps the controller from flipping between LEFT and FORWARD on tiny frame-to-frame noise.
+    def choose_cmd_with_hysteresis(turn, steer_state):
+        if steer_state == "LEFT":
+            if turn > LEFT_EXIT_THRESH:
+                steer_state = "STRAIGHT"
+        elif steer_state == "RIGHT":
+            if turn < RIGHT_EXIT_THRESH:
+                steer_state = "STRAIGHT"
+        else:
+            if turn < LEFT_ENTER_THRESH:
+                steer_state = "LEFT"
+            elif turn > RIGHT_ENTER_THRESH:
+                steer_state = "RIGHT"
 
-    if steer_state == "LEFT":
-        return CMD_LEFT, steer_state
-    elif steer_state == "RIGHT":
-        return CMD_RIGHT, steer_state
-    else:
-        return CMD_UP, steer_state
+        if steer_state == "LEFT":
+            return CMD_LEFT, steer_state
+        elif steer_state == "RIGHT":
+            return CMD_RIGHT, steer_state
+        else:
+            return CMD_UP, steer_state
 
 def process_frame(frame_bgr, tracker: SimpleLineTracker):
-    h, w = frame_bgr.shape[:2]
+    h, w = frame_bgr.shape[:2] 
+    # frame center
+    cv2.line(out, (w//2, 0), (w//2, h-1), (255, 255, 0), 1)
+    cv2.line(mask_debug, (w//2, 0), (w//2, h-1), (255, 255, 0), 1)
+
+    # quarter guides
+    for x in [int(0.25*w), int(0.75*w)]:
+        cv2.line(out, (x, 0), (x, h-1), (100, 100, 255), 1)
+        cv2.line(mask_debug, (x, 0), (x, h-1), (100, 100, 255), 1)
+
+    roi_pts = np.array([[
+    (int(w*ROI_VERTICES_RATIO['bottom_left'][0]),  int(h*ROI_VERTICES_RATIO['bottom_left'][1])),
+    (int(w*ROI_VERTICES_RATIO['top_left'][0]),     int(h*ROI_VERTICES_RATIO['top_left'][1])),
+    (int(w*ROI_VERTICES_RATIO['top_right'][0]),    int(h*ROI_VERTICES_RATIO['top_right'][1])),
+    (int(w*ROI_VERTICES_RATIO['bottom_right'][0]), int(h*ROI_VERTICES_RATIO['bottom_right'][1]))
+    ]], dtype=np.int32)
+
+    cv2.polylines(out, roi_pts, True, (0, 165, 255), 2)
+    cv2.polylines(mask_debug, roi_pts, True, (0, 165, 255), 2)
+
+    
     y_bottom = h - 1
     y_top    = int(h * ROI_VERTICES_RATIO['top_left'][1])
 
@@ -643,6 +663,8 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker):
 
     u, err_norm = tracker.control_from_x(line_x_bottom)
     forward, turn = apply_steering(u)
+    target_x = int(tracker.target_x_ratio * w)
+    err_px = None if line_x_bottom is None else int(line_x_bottom - target_x)
 
     print(f"[TELEM] LineX={line_x_bottom}  ErrNorm={err_norm:+.2f}  AngleAbsDeg={angle_deg}")
     if SAVE_DEBUG_IMAGES:
@@ -650,6 +672,22 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker):
         cv2.imwrite("output.jpg", out)
         cv2.imwrite("input.jpg", frame_bgr)
         cv2.imwrite("mask.jpg", mask_debug)
+
+    info_lines = [
+    f"W={w} H={h}",
+    f"TargetX={target_x}",
+    f"LineX={None if line_x_bottom is None else int(line_x_bottom)}",
+    f"ErrPx={err_px}",
+    f"ErrNorm={err_norm:+.2f}",
+    f"Turn={turn:+.2f}",
+    f"Angle={angle_deg if angle_deg is not None else 'None'}",
+    ]
+
+    y0 = 25
+    for i, txt in enumerate(info_lines):
+        y = y0 + i*24
+        cv2.putText(out, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,255), 2)
+        cv2.putText(mask_debug, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,255), 2)
 
 
     return out, mask_debug, forward, turn, (angle_deg if angle_deg is not None else 0.0), line_x_bottom, err_norm
@@ -873,25 +911,50 @@ def cleanup_system(mc=None, cap=None, lidar=None, ser=None, serial_lock=None):
 
     print("[INFO] Clean exit.") #confirmation that shutdown completed
 
-def show_debug_view(frame, out, mask_debug, active_side, state, cmd, fps):
+def show_debug_view(frame, out, mask_debug, active_side, state, cmd, fps,
+                    lidar_state=None, line_x_bottom=None, target_x=None,
+                    err_norm=None, turn=None, lane_visible=None):
     if not USE_DISPLAY or frame is None:
         return False
 
-    tl_text = f"{active_side} | state={state} cmd={cmd}"
+    tl_text = f"{active_side} | state={state} | cmd={cmd}"
 
     if SHOW_STACKED_DEBUG and out is not None and mask_debug is not None:
         h = 300
         raw_r = cv2.resize(frame, (int(frame.shape[1] * h / frame.shape[0]), h))
         md_r = cv2.resize(mask_debug, (raw_r.shape[1], h))
         out_r = cv2.resize(out, (raw_r.shape[1], h))
-        debug_view = np.vstack((np.hstack((raw_r, md_r)), np.hstack((out_r, out_r * 0))))
-        cv2.putText(debug_view, tl_text, (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
+        blank = np.zeros_like(out_r)
+        debug_view = np.vstack((np.hstack((raw_r, md_r)), np.hstack((out_r, blank))))
+        
     else:
-        debug_view = out if out is not None else frame.copy()
-        cv2.putText(debug_view, tl_text, (10, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
+        debug_view = out.copy() if out is not None else frame.copy()
 
+    # Main title
+    cv2.putText(debug_view, tl_text, (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (50, 255, 50), 2)
+
+    y = 52
+
+    # LIDAR telemetry
+    if lidar_state is not None:
+        lidar_text = f"dL={fmt_mm(lidar_state.dL)}  dC={fmt_mm(lidar_state.dC)}  dR={fmt_mm(lidar_state.dR)}"
+        cv2.putText(debug_view, lidar_text, (10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+        y += 26
+
+    # Camera telemetry
+    cam_text = (
+        f"LineX={None if line_x_bottom is None else int(line_x_bottom)}  "
+        f"TargetX={target_x}  "
+        f"ErrNorm={None if err_norm is None else f'{err_norm:+.2f}'}  "
+        f"Turn={None if turn is None else f'{turn:+.2f}'}  "
+        f"LaneVisible={lane_visible}"
+    )
+    cv2.putText(debug_view, cam_text, (10, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
+
+    # FPS at bottom
     cv2.putText(debug_view, f"FPS: {fps:.1f}", (10, debug_view.shape[0] - 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
@@ -1345,13 +1408,13 @@ def run_full_integrated(mc):
                         else:
                             print("[STATE] CHANGE_ALIGN_TO_LEFT complete -> CAM_LANE_LEFT")
                             state = "CAM_LANE_LEFT"
-                        steer_state = "STRAIGHT"   # restart lane-following with clean steering memory
+                        steer_state = "STRAIGHT"
                         state_start_time = now
                         cmd = CMD_UP
                     else:
-                        cmd = CMD_UP
+                        cmd, steer_state = choose_cmd_with_hysteresis(turn, steer_state)
                 else:
-                    cmd = CMD_UP
+                    cmd = STOP_CMD
 
             elif state in ("CAM_LANE_LEFT", "CAM_LANE_RIGHT"):
                 if lane_visible:
