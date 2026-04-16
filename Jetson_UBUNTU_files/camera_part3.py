@@ -926,7 +926,6 @@ def show_debug_view(frame, out, mask_debug, active_side, state, cmd, fps,
         out_r = cv2.resize(out, (raw_r.shape[1], h))
         blank = np.zeros_like(out_r)
         debug_view = np.vstack((np.hstack((raw_r, md_r)), np.hstack((out_r, blank))))
-        
     else:
         debug_view = out.copy() if out is not None else frame.copy()
 
