@@ -68,10 +68,11 @@ STOP_CMD   = "Stop"
 # RIGHT_ENTER_THRESH =  0.24
 # RIGHT_EXIT_THRESH  =  0.12
 
-LEFT_ENTER_THRESH  = -0.10
-LEFT_EXIT_THRESH   = -0.05
-RIGHT_ENTER_THRESH =  0.10
-RIGHT_EXIT_THRESH  =  0.05
+LEFT_ENTER_THRESH  = -0.25  # Require a bigger error to start turning LEFT
+LEFT_EXIT_THRESH   = -0.10  # Stop turning sooner
+RIGHT_ENTER_THRESH =  0.25  # Require a bigger error to start turning RIGHT
+RIGHT_EXIT_THRESH  =  0.10  # Stop turning sooner
+
 
 
 # =========================
@@ -118,21 +119,27 @@ ALIGN_TURN_EPS              = 0.05  # |turn| <= this => aligned
 # Lane / camera tunables
 # =========================
 
+# ROI_VERTICES_RATIO = dict(
+#     bottom_left = (0.05, 0.98),
+#     top_left    = (0.22, 0.35),  # Changed from 0.60 to 0.35 to see higher up
+#     top_right   = (0.78, 0.35),  # Changed from 0.60 to 0.35
+#     bottom_right= (0.95, 0.98),
+# )
 ROI_VERTICES_RATIO = dict(
-    bottom_left = (0.05, 0.98),
-    top_left    = (0.22, 0.60),
-    top_right   = (0.78, 0.60),
-    bottom_right= (0.95, 0.98),
+    bottom_left  = (0.05, 0.95),
+    top_left     = (0.05, 0.35), # Raised from 0.55 to 0.35 to see "further"
+    top_right    = (0.95, 0.35), # Balanced with top_left
+    bottom_right = (0.95, 0.95),
 )
 
 HSV_S_MAX = 70
-HSV_V_MIN = 170
+HSV_V_MIN = 200
 HSV_H_ANY = (0, 180)
 
 LAB_A_ABS_MAX = 20
 LAB_B_ABS_MAX = 20
 
-Y_MIN = 160
+Y_MIN = 210
 CR_ABS_MAX = 14
 CB_ABS_MAX = 14
 
@@ -142,15 +149,15 @@ OTSU_RATIO = 0.60
 OPEN_K  = (3, 3)
 CLOSE_K = (11, 11)
 
-MIN_AREA             = 80 #old: 100
-MIN_HEIGHT           = 15 #old: 20
+MIN_AREA             = 80 #old: 80
+MIN_HEIGHT           = 15 #old: 15
 MIN_WIDTH            = 2
-MIN_ASPECT_H_OVER_W  = 0.6 #old: 1.0
+MIN_ASPECT_H_OVER_W  = 1 #old: 0.6,1.0
 ANGLE_TOL_DEG        = 90
 
 CENTER_DEADBAND = 0.07
-DUAL_KP = 1.05
-DUAL_KD = 0.18
+DUAL_KP = 0.9
+DUAL_KD = 0.8
 DUAL_U_THRESH = 0.18
 # Single-side: creep forward until line norm exceeds these, then turn away from that line.
 SINGLE_LEFT_DANGER_RATIO = 0.52
@@ -161,8 +168,8 @@ BLIND_PULSE_WAIT_SEC = 2.0
 
 
 #### changing ratios to avoid spasing
-TARGET_X_RATIO_LEFT = 0.43 # old 0.43
-TARGET_X_RATIO_RIGHT = 0.65 # old 0.65
+TARGET_X_RATIO_LEFT = 0.20 # old 0.43
+TARGET_X_RATIO_RIGHT = 0.80 # old 0.65
 
 # PD gains
 Kp = 0.9
@@ -182,8 +189,8 @@ SAVE_DEBUG_IMAGES = True
 
 
 # Updated paths based on your 'ls -l' output
-RIGHT_CAM_INDEX = "/dev/v4l/by-path/platform-3610000.usb-usb-0:1.2:1.0-video-index0"
 LEFT_CAM_INDEX = "/dev/v4l/by-path/platform-3610000.usb-usb-0:1.1.1:1.0-video-index0"
+RIGHT_CAM_INDEX = "/dev/v4l/by-path/platform-3610000.usb-usb-0:1.2:1.0-video-index0"
 CAM_BACKEND     = cv2.CAP_V4L2   # or cv2.CAP_ANY
 
 # lane-loss tolerance (we'll use simple stop on long loss)
@@ -690,8 +697,8 @@ def open_camera_by_index(label: str):
 
 def tune_camera_for_speed(cap, label: str):
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  320) #previous 960
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 320) #previous 540
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  480) #previous 960
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 270) #previous 540
     cap.set(cv2.CAP_PROP_FPS, 30)
 
     w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
@@ -772,7 +779,7 @@ def initialize_system():
 
 def detect_objects(frame,detector:YOLO):
     detections = []
-    results = detector(frame, imgsz=320, verbose=False)
+    results = detector(frame, verbose=False)
 
     for r in results:
         for box in r.boxes:
@@ -922,8 +929,9 @@ def camera_worker(shared, shm_name_L, shm_name_R):
         return
     shm_L = shared_memory.SharedMemory(name=shm_name_L)
     shm_R = shared_memory.SharedMemory(name=shm_name_R)
-    buf_L = np.ndarray((320,320,3), dtype=np.uint8, buffer=shm_L.buf)
-    buf_R = np.ndarray((320,320,3), dtype=np.uint8, buffer=shm_R.buf)
+    
+    buf_L = np.ndarray((270, 480, 3), dtype=np.uint8, buffer=shm_L.buf)
+    buf_R = np.ndarray((270, 480, 3), dtype=np.uint8, buffer=shm_R.buf)
     
     print("[CAMERA PROCESS] started")
 
@@ -933,9 +941,9 @@ def camera_worker(shared, shm_name_L, shm_name_R):
         retR, imgR = cap_R.read()
 
         if retL:
-            buf_L[:] = cv2.resize(imgL, (320, 320), interpolation=cv2.INTER_NEAREST)
+            buf_L[:] = cv2.resize(imgL, (480, 270), interpolation=cv2.INTER_NEAREST)
         if retR:
-            buf_R[:] = cv2.resize(imgR, (320, 320), interpolation=cv2.INTER_NEAREST)
+            buf_R[:] = cv2.resize(imgR, (480, 270), interpolation=cv2.INTER_NEAREST)
         time.sleep(0.01)
         
 
@@ -946,11 +954,11 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
     shm_L = shared_memory.SharedMemory(name=shm_name_L)
     shm_R = shared_memory.SharedMemory(name=shm_name_R)
     
-    frame_L = np.ndarray((320, 320, 3), dtype=np.uint8, buffer=shm_L.buf)
-    frame_R = np.ndarray((320, 320, 3), dtype=np.uint8, buffer=shm_R.buf)
+    frame_L = np.ndarray((270, 480, 3), dtype=np.uint8, buffer=shm_L.buf)
+    frame_R = np.ndarray((270, 480, 3), dtype=np.uint8, buffer=shm_R.buf)
     
-    tracker_L = SimpleLineTracker(320, TARGET_X_RATIO_LEFT)
-    tracker_R = SimpleLineTracker(320, TARGET_X_RATIO_RIGHT)
+    tracker_L = SimpleLineTracker(480, TARGET_X_RATIO_LEFT)
+    tracker_R = SimpleLineTracker(480, TARGET_X_RATIO_RIGHT)
     
     prev_e = 0.0
 
@@ -965,16 +973,19 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
         try:
             out_L, mask_L, _, _, _, line_x_L, _ = process_frame(img_L, tracker_L)
             out_R, mask_R, _, _, _, line_x_R, _ = process_frame(img_R, tracker_R)
-            u_L, err_L = tracker_L.control_from_x(line_x_L)
-            u_R, err_R = tracker_R.control_from_x(line_x_R)
             
-            nL = line_x_L / 320 if line_x_L is not None else None
-            nR = line_x_R / 320 if line_x_R is not None else None
+            nL = line_x_L / 480 if line_x_L is not None else None
+            nR = line_x_R / 480 if line_x_R is not None else None
 
             if nL is not None and nR is not None:
- 
+                err_L = nL - TARGET_X_RATIO_LEFT
+                err_R = nR - TARGET_X_RATIO_RIGHT
+    
+    # Differential Error: e > 0 means too far right (steer left); e < 0 means too far left
+                #error = err_R - err_L
                 current_center = (nL + nR) / 2.0
                 error = 0.5 - current_center
+                #error = 0.5 - current_center
                 de = error - prev_e
                 prev_e = error
                 
@@ -995,7 +1006,7 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
                 shared["lane_visible_L"].value = False
                 shared["lane_visible_R"].value = False
                 
-            debug_view = np.hstack((out_L, out_R))
+            debug_view = np.hstack((out_L, out_R,mask_L,mask_R))
             # Draw some text or lines so you know the logic is working
             cv2.putText(debug_view, f"Turn: {shared['lane_turn'].value:.2f}", (10, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
@@ -1016,11 +1027,11 @@ def yolo_worker(shared,shm_name):
     detector = YOLO("./yolov8n.pt")
     detector.to("cpu")
     shm = shared_memory.SharedMemory(name=shm_name)
-    frame = np.ndarray((320,320,3), dtype=np.uint8, buffer=shm.buf)
+    frame = np.ndarray((270,480,3), dtype=np.uint8, buffer=shm.buf)
     
     #constants
     FOV = 62.0  # degrees (Jetson CSI cam approx, adjust if needed)
-    IMG_W = 320
+    IMG_W = 480
     
     #stop event variables
     stop_detected = False
@@ -1410,7 +1421,7 @@ def run_integrated():
     ser = None
     mc = None
 
-    frame_shape = (320,320,3)
+    frame_shape = (270,480,3)
     frame_size = np.prod(frame_shape)
 
     shared = {}
@@ -1516,9 +1527,12 @@ def run_integrated():
     except KeyboardInterrupt:
         print("\n[INFO] Ctrl-C")
     finally:
-        print("[MAIN] Emergency Stop...")
-        if 'mc' in locals() and mc is not None:
-            mc.send(STOP_CMD, force=True)
+        try:
+            if mc is not None:
+                # Use force=True to bypass the 0.08s interval check
+                mc.send(STOP_CMD, force=True) 
+        except Exception as e:
+            print(f"[WARN] Failed to send stop: {e}")
             
         print("[MAIN] Shutting down workers...")
         for p in [lidar_proc, yolo_proc, lane_proc, camera_proc]:
