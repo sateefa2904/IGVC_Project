@@ -829,14 +829,19 @@ def detect_objects(frame,detector:YOLO):
 #helper function for object detection handling
 #measures the distance from an object by the size of its bounding box
 #the measurement may need to be calibrated based on the cameras focal length
-def measure_distance(shared,angle):
-    if -15 <= angle <= 15:
-        return shared["dF"].value
-    elif angle > 15:
-        return shared["dFL"].value
-    elif angle < -15:
-        return shared["dFR"].value
-    return float("inf")
+def measure_distance(bbox,focal_length,real_height):
+    """
+    focal length is a pre-calibrated focal langth from our camera. Needs to be confirmed, currently a placeholder
+    real_height is the real height of the object being detected
+    distance is returned in meters
+    """
+    x1,y1,x2,y2 = bbox
+    height = abs(y2-y1)
+
+    if height <= 0: return None
+
+    distance = (real_height * focal_length)/(height)
+    return distance
 
 def cleanup_system(mc=None, ser=None, serial_lock=None):
     try:
@@ -967,94 +972,139 @@ def camera_worker(shared, shm_name_L, shm_name_R):
             buf_R[:] = cv2.resize(imgR, (480, 270), interpolation=cv2.INTER_NEAREST)
         time.sleep(0.01)
         
-
-        
-
 def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
     preview_state, preview_lock = preview_bundle
     shm_L = shared_memory.SharedMemory(name=shm_name_L)
     shm_R = shared_memory.SharedMemory(name=shm_name_R)
-    
+
     frame_L = np.ndarray((270, 480, 3), dtype=np.uint8, buffer=shm_L.buf)
     frame_R = np.ndarray((270, 480, 3), dtype=np.uint8, buffer=shm_R.buf)
-    
+
     tracker_L = SimpleLineTracker(480, TARGET_X_RATIO_LEFT)
     tracker_R = SimpleLineTracker(480, TARGET_X_RATIO_RIGHT)
-    
-    prev_e = 0.0
-    SINGLE_KP = DUAL_KP * 0.5  # Cut the gain in half when relying on one eye
 
+    prev_e        = 0.0
+    last_turn     = 0.0   # last turn value we were confident about
+    glitch_count  = 0     # consecutive frames where we lost a previously-seen camera
+
+    # How many frames of camera loss we tolerate before switching modes.
+    # At 33Hz, 5 frames = ~150ms — enough to absorb angle-filter glitches
+    # but short enough to not delay curve response.
+    GLITCH_TOLERANCE = 5
 
     print("[LANE PROCESS] started")
     while True:
-
         img_L = frame_L.copy()
-        img_R = frame_R.copy()  # optional safety
-        #cv2.imwrite("lane_worker.jpg", img)
+        img_R = frame_R.copy()
 
         try:
             out_L, mask_L, _, _, _, line_x_L, _ = process_frame(img_L, tracker_L)
             out_R, mask_R, _, _, _, line_x_R, _ = process_frame(img_R, tracker_R)
-            
-            nL = line_x_L / 480 if line_x_L is not None else None
-            nR = line_x_R / 480 if line_x_R is not None else None
-            
 
+            nL = line_x_L / 480.0 if line_x_L is not None else None
+            nR = line_x_R / 480.0 if line_x_R is not None else None
+
+            # ------------------------------------------------
+            # BOTH cameras: standard dual PD control
+            # ------------------------------------------------
             if nL is not None and nR is not None:
-                
-                err_R = nR - TARGET_X_RATIO_RIGHT
-                err_L = nL - TARGET_X_RATIO_LEFT
-    
-                # Differential Error: e > 0 means too far right (steer left); e < 0 means too far left
-  
-                #current_center = (nL + nR) / 2.0
-                
-                #error = 0.5 - current_center
+                glitch_count = 0
+
                 current_center = (nL + nR) / 2.0
                 error = 0.5 - current_center
-                de = error - prev_e
+                de    = error - prev_e
                 prev_e = error
-                
+
                 turn_val = DUAL_KP * error + DUAL_KD * de
-                
+
                 if abs(error) < CENTER_DEADBAND:
                     turn_val = 0.0
-                
+
+                turn_val  = float(np.clip(turn_val, -1.0, 1.0))
+                last_turn = turn_val
+
+                shared["lane_turn"].value      = turn_val
+                shared["lane_visible_L"].value = True
+                shared["lane_visible_R"].value = True
+                print(f"[LANE] DUAL  | center={current_center:.2f} err={error:+.2f} turn={turn_val:+.2f}")
+
+            # ------------------------------------------------
+            # ONE camera: direct error → turn, no hold/blend
+            # ------------------------------------------------
+            elif nL is not None or nR is not None:
+
+                if nL is not None:
+                    # Left line is visible.
+                    # nL is its normalized x position (0=left edge, 1=right edge).
+                    # If nL is RIGHT of target → robot has drifted left → steer right (+turn).
+                    # If nL is LEFT of target  → robot has drifted right → steer left (-turn).
+                    err   = nL - TARGET_X_RATIO_LEFT
+                    # Use full DUAL_KP — the error itself is already small near center
+                    # and large on a real curve, so the gain doesn't need to be cut.
+                    turn_val = float(np.clip(-err * DUAL_KP, -0.8, 0.8))
+                    shared["lane_visible_L"].value = True
+                    shared["lane_visible_R"].value = False
+                    print(f"[LANE] LEFT  | nL={nL:.2f} err={err:+.2f} turn={turn_val:+.2f}")
+
+                else:
+                    err   = nR - TARGET_X_RATIO_RIGHT
+                    turn_val = float(np.clip(-err * DUAL_KP, -0.8, 0.8))
+                    shared["lane_visible_L"].value = False
+                    shared["lane_visible_R"].value = True
+                    print(f"[LANE] RIGHT | nR={nR:.2f} err={err:+.2f} turn={turn_val:+.2f}")
+
+                glitch_count += 1
+
+                if glitch_count <= GLITCH_TOLERANCE:
+                    # Within glitch window: blend toward new reading so a single
+                    # bad frame from the angle filter doesn't cause a jerk.
+                    # blend_alpha=0 means "all last_turn", blend_alpha=1 means "all new"
+                    blend_alpha = glitch_count / GLITCH_TOLERANCE
+                    turn_val    = (1.0 - blend_alpha) * last_turn + blend_alpha * turn_val
+                    print(f"[LANE] blending α={blend_alpha:.1f} → {turn_val:+.2f}")
+
+                # After glitch window, turn_val is used directly — no cap, no delay.
+                # last_turn is NOT updated in single-cam mode so that if we re-acquire
+                # both cameras, the blend starts from the last dual-cam value.
+                turn_val = float(np.clip(turn_val, -1.0, 1.0))
                 shared["lane_turn"].value = turn_val
-                shared["lane_visible_L"].value = True
-                shared["lane_visible_R"].value = True
-            elif nL is not None:
-                # Single-side fallback
-                #shared["lane_turn"].value = -0.4 if nL > SINGLE_LEFT_DANGER_RATIO else 0.0
-                err_L = nL - TARGET_X_RATIO_LEFT
-                shared["lane_turn"].value = SINGLE_KP * (-err_L)
-                shared["lane_visible_L"].value = True
-                shared["lane_visible_R"].value = False
-            elif nR is not None:
-                # Single-side fallback
-                #shared["lane_turn"].value = 0.4 if nR > SINGLE_RIGHT_DANGER_RATIO else 0.0
-                err_R = nR - TARGET_X_RATIO_RIGHT
-                shared["lane_turn"].value = SINGLE_KP * (-err_R)
-                shared["lane_visible_L"].value = False
-                shared["lane_visible_R"].value = True
+
+            # ------------------------------------------------
+            # NO cameras: hold last turn briefly, then go straight
+            # ------------------------------------------------
             else:
+                glitch_count += 1
+                prev_e = 0.0  # reset derivative — no spike when vision returns
+
+                if glitch_count <= GLITCH_TOLERANCE:
+                    # Hold the last known good value for a moment
+                    shared["lane_turn"].value = last_turn
+                    print(f"[LANE] BLIND | holding {last_turn:+.2f} ({glitch_count}/{GLITCH_TOLERANCE})")
+                else:
+                    # Extended blind — go straight, we have no information
+                    shared["lane_turn"].value = 0.0
+                    print(f"[LANE] BLIND | extended, going straight")
+
                 shared["lane_visible_L"].value = False
                 shared["lane_visible_R"].value = False
-                
-            debug_view = np.hstack((out_L, out_R,mask_L,mask_R))
-            # Draw some text or lines so you know the logic is working
-            cv2.putText(debug_view, f"Turn: {shared['lane_turn'].value:.2f}", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        
-            # Encode and send to the HTTP server
+
+            # Debug overlay
+            debug_view = np.hstack((out_L, out_R, mask_L, mask_R))
+            cv2.putText(debug_view, f"Turn: {shared['lane_turn'].value:.2f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cam_status = f"L:{'OK' if nL is not None else '--'}  R:{'OK' if nR is not None else '--'}"
+            cv2.putText(debug_view, cam_status, (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+
             ok, jpg = cv2.imencode(".jpg", debug_view, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 with preview_lock:
                     preview_state.jpeg_bytes = jpg.tobytes()
-                print("[LANE] Frame sent to preview") # Debug print
+
         except Exception as e:
             print("[LANE ERROR]", e)
-      
+
+        time.sleep(0.03)
 #Isaac Elizarraraz [3/31/2026]
 #thread worker that finds objects in current frame
 def yolo_worker(shared,shm_name):
@@ -1065,8 +1115,8 @@ def yolo_worker(shared,shm_name):
     frame = np.ndarray((270,480,3), dtype=np.uint8, buffer=shm.buf)
     
     #constants
-    FOV = 62.0  # degrees (Jetson CSI cam approx, adjust if needed)
-    IMG_W = 480
+    real_height = 0.3048
+    focal_length = 650
     
     #stop event variables
     stop_detected = False
@@ -1099,11 +1149,12 @@ def yolo_worker(shared,shm_name):
             if detections:
                 shared["det_time"].value = time.time()
 
-            for d in detections:
-                x1, y1, x2, y2 = d["bbox"]
-                cx = (x1 + x2) / 2
-                angle = angle = (cx - IMG_W/2) / (IMG_W/2) * (FOV/2)
-                distance = measure_distance(shared,angle)
+            for d in detections:  
+                distance = measure_distance(
+                            d["bbox"],
+                            focal_length,
+                            real_height
+                        )
                 if d["label"] == "stop sign":
                     stop_detected = True
                     stop_frame_counter += 1
@@ -1300,10 +1351,7 @@ def run_full_integrated(mc, shared):
             # =========================
             cmd, steer_state = choose_cmd_with_hysteresis(final_turn, steer_state)
 
-            # When in a gentle correction (inside hysteresis band), just go forward —
-            # don't send a pivot command for small errors.
-            if steer_state == "STRAIGHT":
-                cmd = CMD_UP
+ 
 
             mc.send(cmd)
 
