@@ -68,10 +68,16 @@ STOP_CMD   = "Stop"
 # RIGHT_ENTER_THRESH =  0.24
 # RIGHT_EXIT_THRESH  =  0.12
 
-LEFT_ENTER_THRESH  = -0.25  # Require a bigger error to start turning LEFT
-LEFT_EXIT_THRESH   = -0.10  # Stop turning sooner
-RIGHT_ENTER_THRESH =  0.25  # Require a bigger error to start turning RIGHT
-RIGHT_EXIT_THRESH  =  0.10  # Stop turning sooner
+# LEFT_ENTER_THRESH  = -0.25  # Require a bigger error to start turning LEFT
+# LEFT_EXIT_THRESH   = -0.10  # Stop turning sooner
+# RIGHT_ENTER_THRESH =  0.25  # Require a bigger error to start turning RIGHT
+# RIGHT_EXIT_THRESH  =  0.10  # Stop turning sooner
+
+# --- Update these constants at the top of your script ---
+LEFT_ENTER_THRESH  = -0.15  # React sooner (was -0.25)
+LEFT_EXIT_THRESH   = -0.05  # Stop turning much earlier to prevent overshoot (was -0.10)
+RIGHT_ENTER_THRESH =  0.15  # React sooner (was 0.25)
+RIGHT_EXIT_THRESH  =  0.05  # Stop turning much earlier (was 0.10)
 
 
 
@@ -94,7 +100,7 @@ FORWARD_SECTORS = {
     'FL': (+10.0, +60.0),
 }
 
-THRESH_MAIN        = 762   # main "open" threshold (mm)
+THRESH_MAIN        = 500   # main "open" threshold (mm)
 BACKOFF_CLEAR_ANY  = 850
 NEAR_OBS_TRIP      = 300   # too close -> back up
 NEAR_OBS_RELEASE   = 500   # safe again
@@ -156,20 +162,20 @@ MIN_ASPECT_H_OVER_W  = 1 #old: 0.6,1.0
 ANGLE_TOL_DEG        = 90
 
 CENTER_DEADBAND = 0.07
-DUAL_KP = 0.9
-DUAL_KD = 0.8
+DUAL_KP = 0.7 #0.9 
+DUAL_KD = 0.3
 DUAL_U_THRESH = 0.18
 # Single-side: creep forward until line norm exceeds these, then turn away from that line.
-SINGLE_LEFT_DANGER_RATIO = 0.52
-SINGLE_RIGHT_DANGER_RATIO = 0.52
+SINGLE_LEFT_DANGER_RATIO = 0.40
+SINGLE_RIGHT_DANGER_RATIO = 0.50
 # When not BOTH and steering wants Left/Right: turn briefly, then Stop so cameras can update.
 BLIND_PULSE_TURN_SEC = 1.0
 BLIND_PULSE_WAIT_SEC = 2.0
 
 
 #### changing ratios to avoid spasing
-TARGET_X_RATIO_LEFT = 0.20 # old 0.43
-TARGET_X_RATIO_RIGHT = 0.80 # old 0.65
+TARGET_X_RATIO_LEFT = 0.25 # old 0.43
+TARGET_X_RATIO_RIGHT = 0.75 # old 0.65
 
 # PD gains
 Kp = 0.9
@@ -185,7 +191,7 @@ MIRROR_FRAME = False
 
 USE_DISPLAY        = False
 SHOW_STACKED_DEBUG = False
-SAVE_DEBUG_IMAGES = True
+SAVE_DEBUG_IMAGES = False
 
 
 # Updated paths based on your 'ls -l' output
@@ -961,6 +967,7 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
     tracker_R = SimpleLineTracker(480, TARGET_X_RATIO_RIGHT)
     
     prev_e = 0.0
+    SINGLE_KP = DUAL_KP * 0.5  # Cut the gain in half when relying on one eye
 
 
     print("[LANE PROCESS] started")
@@ -976,30 +983,39 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
             
             nL = line_x_L / 480 if line_x_L is not None else None
             nR = line_x_R / 480 if line_x_R is not None else None
+            err_L = nL - TARGET_X_RATIO_LEFT
+            err_R = nR - TARGET_X_RATIO_RIGHT
 
             if nL is not None and nR is not None:
-                err_L = nL - TARGET_X_RATIO_LEFT
-                err_R = nR - TARGET_X_RATIO_RIGHT
+                
     
-    # Differential Error: e > 0 means too far right (steer left); e < 0 means too far left
-                #error = err_R - err_L
-                current_center = (nL + nR) / 2.0
-                error = 0.5 - current_center
+                # Differential Error: e > 0 means too far right (steer left); e < 0 means too far left
+  
+                #current_center = (nL + nR) / 2.0
+                
                 #error = 0.5 - current_center
+                error = err_R - err_L
                 de = error - prev_e
                 prev_e = error
                 
-                shared["lane_turn"].value = DUAL_KP * error + DUAL_KD * de
+                turn_val = DUAL_KP * error + DUAL_KD * de
+                
+                if abs(error) < CENTER_DEADBAND:
+                    turn_val = 0.0
+                
+                shared["lane_turn"].value = turn_val
                 shared["lane_visible_L"].value = True
                 shared["lane_visible_R"].value = True
             elif nL is not None:
                 # Single-side fallback
-                shared["lane_turn"].value = -0.4 if nL > SINGLE_LEFT_DANGER_RATIO else 0.0
+                #shared["lane_turn"].value = -0.4 if nL > SINGLE_LEFT_DANGER_RATIO else 0.0
+                shared["lane_turn"].value = SINGLE_KP * (-err_L)
                 shared["lane_visible_L"].value = True
                 shared["lane_visible_R"].value = False
             elif nR is not None:
                 # Single-side fallback
-                shared["lane_turn"].value = 0.4 if nR > SINGLE_RIGHT_DANGER_RATIO else 0.0
+                #shared["lane_turn"].value = 0.4 if nR > SINGLE_RIGHT_DANGER_RATIO else 0.0
+                shared["lane_turn"].value = SINGLE_KP * (-err_R)
                 shared["lane_visible_L"].value = False
                 shared["lane_visible_R"].value = True
             else:
