@@ -139,17 +139,28 @@ ALIGN_TURN_EPS              = 0.05  # |turn| <= this => aligned
 # Lane / camera tunables
 # =========================
 
+
 # ROI_VERTICES_RATIO = dict(
-#     bottom_left = (0.05, 0.98),
-#     top_left    = (0.22, 0.35),  # Changed from 0.60 to 0.35 to see higher up
-#     top_right   = (0.78, 0.35),  # Changed from 0.60 to 0.35
-#     bottom_right= (0.95, 0.98),
+#     bottom_left  = (0.05, 0.95),
+#     top_left     = (0.05, 0.35), # Raised from 0.55 to 0.35 to see "further"
+#     top_right    = (0.95, 0.35), # Balanced with top_left
+#     bottom_right = (0.95, 0.95),
 # )
-ROI_VERTICES_RATIO = dict(
-    bottom_left  = (0.05, 0.95),
-    top_left     = (0.05, 0.35), # Raised from 0.55 to 0.35 to see "further"
-    top_right    = (0.95, 0.35), # Balanced with top_left
-    bottom_right = (0.95, 0.95),
+
+# The Left camera is not allowed to look past 60% of the screen (Right edge blocked)
+ROI_LEFT_CAM = dict(
+    bottom_left  = (0.00, 0.95),
+    top_left     = (0.00, 0.35),
+    top_right    = (0.60, 0.35), 
+    bottom_right = (0.60, 0.95),
+)
+
+# The Right camera is not allowed to look past 40% of the screen (Left edge blocked)
+ROI_RIGHT_CAM = dict(
+    bottom_left  = (0.40, 0.95), 
+    top_left     = (0.40, 0.35),
+    top_right    = (1.00, 0.35),
+    bottom_right = (1.00, 0.95),
 )
 
 HSV_S_MAX = 70
@@ -504,17 +515,38 @@ def start_mjpeg_server(preview, host="0.0.0.0", port=8765):
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"[HTTP] Preview live at http://localhost:{port}")
+    
+def kill_port(port=8765):
+    """Kill any process still holding the preview server port from a previous run."""
+    try:
+        result = subprocess.check_output(
+            f"fuser {port}/tcp 2>/dev/null", shell=True
+        ).decode().strip()
+        if result:
+            for pid in result.split():
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                    print(f"[BOOT] Killed stale process {pid} holding port {port}")
+                except Exception:
+                    pass
+            time.sleep(0.5)  # give OS a moment to release the port
+    except subprocess.CalledProcessError:
+        pass  # fuser returns non-zero if nothing is holding the port — that's fine
 # =========================
 # Lane / camera helpers
 # =========================
 
-def region_selection(image):
+# Add roi_dict as the second parameter
+def region_selection(image, roi_dict):
     mask = np.zeros_like(image)
     h, w = image.shape[:2]
-    bl = (int(w*ROI_VERTICES_RATIO['bottom_left'][0]),  int(h*ROI_VERTICES_RATIO['bottom_left'][1]))
-    tl = (int(w*ROI_VERTICES_RATIO['top_left'][0]),     int(h*ROI_VERTICES_RATIO['top_left'][1]))
-    tr = (int(w*ROI_VERTICES_RATIO['top_right'][0]),    int(h*ROI_VERTICES_RATIO['top_right'][1]))
-    br = (int(w*ROI_VERTICES_RATIO['bottom_right'][0]), int(h*ROI_VERTICES_RATIO['bottom_right'][1]))
+    
+    # Use the passed dictionary instead of the hardcoded global
+    bl = (int(w*roi_dict['bottom_left'][0]),  int(h*roi_dict['bottom_left'][1]))
+    tl = (int(w*roi_dict['top_left'][0]),     int(h*roi_dict['top_left'][1]))
+    tr = (int(w*roi_dict['top_right'][0]),    int(h*roi_dict['top_right'][1]))
+    br = (int(w*roi_dict['bottom_right'][0]), int(h*roi_dict['bottom_right'][1]))
+    
     pts = np.array([[bl, tl, tr, br]], dtype=np.int32)
     color = 255 if len(image.shape) == 2 else (255,) * image.shape[2]
     cv2.fillPoly(mask, pts, color)
@@ -629,12 +661,12 @@ def choose_cmd_with_hysteresis(turn, steer_state):
     else:
         return CMD_UP, steer_state
 
-def process_frame(frame_bgr, tracker: SimpleLineTracker):
+def process_frame(frame_bgr, tracker: SimpleLineTracker, roi_dict):
     h, w = frame_bgr.shape[:2]
     y_bottom = h - 1
-    y_top    = int(h * ROI_VERTICES_RATIO['top_left'][1])
+    y_top    = int(h * roi_dict['top_left'][1]) # Use roi_dict here
 
-    roi = region_selection(frame_bgr)
+    roi = region_selection(frame_bgr, roi_dict)
     mask_white = white_mask(roi)
     mask_white = morph_clean(mask_white)
 
@@ -1005,12 +1037,8 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
 
     prev_e        = 0.0
     last_turn     = 0.0   # last turn value we were confident about
-    glitch_count  = 0     # consecutive frames where we lost a previously-seen camera
+    
 
-    # How many frames of camera loss we tolerate before switching modes.
-    # At 33Hz, 5 frames = ~150ms — enough to absorb angle-filter glitches
-    # but short enough to not delay curve response.
-    GLITCH_TOLERANCE = 3
 
     print("[LANE PROCESS] started")
     while True:
@@ -1018,9 +1046,9 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
         img_R = frame_R.copy()
 
         try:
-            out_L, mask_L, _, _, _, line_x_L, _ = process_frame(img_L, tracker_L)
-            out_R, mask_R, _, _, _, line_x_R, _ = process_frame(img_R, tracker_R)
-
+            out_L, mask_L, _, _, _, line_x_L, _ = process_frame(img_L, tracker_L, ROI_LEFT_CAM)
+            out_R, mask_R, _, _, _, line_x_R, _ = process_frame(img_R, tracker_R, ROI_RIGHT_CAM
+                                                                )
             nL = line_x_L / 480.0 if line_x_L is not None else None
             nR = line_x_R / 480.0 if line_x_R is not None else None
 
@@ -1046,7 +1074,7 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
                 turn_val  = float(np.clip(turn_val, -1.0, 1.0))
                 last_turn = turn_val
 
-                shared["lane_turn"].value      = turn_val
+                shared["lane_turn"].value      = turn_val 
                 shared["lane_visible_L"].value = True
                 shared["lane_visible_R"].value = True
 
@@ -1060,7 +1088,7 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
                     
                     # FIX: Removed the negative sign
                     turn_val = float(np.clip(err * DUAL_KP, -0.8, 0.8)) 
-                    
+                    shared["lane_turn"].value = turn_val
                     shared["lane_visible_L"].value = True
                     shared["lane_visible_R"].value = False
 
@@ -1069,7 +1097,7 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
                     
                     # FIX: Removed the negative sign
                     turn_val = float(np.clip(err * DUAL_KP, -0.8, 0.8)) 
-                    
+                    shared["lane_turn"].value = turn_val
                     shared["lane_visible_L"].value = False
                     shared["lane_visible_R"].value = True
 
@@ -1248,8 +1276,8 @@ def run_full_integrated(mc, shared):
     steer_state = "STRAIGHT"  # Hysteresis state: "STRAIGHT", "LEFT", or "RIGHT"
 
     # Tuned constants (moved here so they're easy to adjust)
-    AVOID_ZONE   = 450.0  # mm — was 800, reduced to avoid fighting the lane controller
-    MAX_REPULSION = 0.6   # was 0.8
+    AVOID_ZONE   = 800.0  # mm — was 800, reduced to avoid fighting the lane controller
+    MAX_REPULSION = 0.8   # was 0.8
 
     try:
         while True:
@@ -1509,6 +1537,7 @@ def run_integrated():
                 s.unlink()
             except Exception:
                 pass
+        kill_port(8765)
         cleanup_system(mc=mc, ser=ser, serial_lock=serial_lock)
         
 
