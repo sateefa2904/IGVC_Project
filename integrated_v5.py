@@ -1068,12 +1068,12 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
 
                 turn_val = DUAL_KP * error + DUAL_KD * de
 
-                if abs(error) < CENTER_DEADBAND:
-                    turn_val = 0.0
+                
 
                 turn_val  = float(np.clip(turn_val, -1.0, 1.0))
                 last_turn = turn_val
-
+                if abs(error) < CENTER_DEADBAND:
+                    turn_val = 0.0
                 shared["lane_turn"].value      = turn_val 
                 shared["lane_visible_L"].value = True
                 shared["lane_visible_R"].value = True
@@ -1088,6 +1088,8 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
                     
                     # FIX: Removed the negative sign
                     turn_val = float(np.clip(err * DUAL_KP, -0.8, 0.8)) 
+                    if abs(err) < CENTER_DEADBAND:
+                        turn_val = 0.0
                     shared["lane_turn"].value = turn_val
                     shared["lane_visible_L"].value = True
                     shared["lane_visible_R"].value = False
@@ -1097,6 +1099,8 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
                     
                     # FIX: Removed the negative sign
                     turn_val = float(np.clip(err * DUAL_KP, -0.8, 0.8)) 
+                    if abs(err) < CENTER_DEADBAND:
+                        turn_val = 0.0
                     shared["lane_turn"].value = turn_val
                     shared["lane_visible_L"].value = False
                     shared["lane_visible_R"].value = True
@@ -1276,7 +1280,7 @@ def run_full_integrated(mc, shared):
     steer_state = "STRAIGHT"  # Hysteresis state: "STRAIGHT", "LEFT", or "RIGHT"
 
     # Tuned constants (moved here so they're easy to adjust)
-    AVOID_ZONE   = 800.0  # mm — was 800, reduced to avoid fighting the lane controller
+    AVOID_ZONE   = 1200.0  # mm — was 800, reduced to avoid fighting the lane controller
     MAX_REPULSION = 0.8   # was 0.8
 
     try:
