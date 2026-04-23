@@ -93,6 +93,8 @@ RIGHT_EXIT_THRESH  =  0.02
 
 
 
+
+
 # =========================
 # LIDAR config / thresholds
 # =========================
@@ -173,7 +175,7 @@ MIN_WIDTH            = 2
 MIN_ASPECT_H_OVER_W  = 1 #old: 0.6,1.0
 ANGLE_TOL_DEG        = 80
 
-CENTER_DEADBAND = 0.04
+CENTER_DEADBAND = 0.1
 DUAL_KP = 1.0 #0.6 #0.9 
 DUAL_KD = 0.4
 DUAL_U_THRESH = 0.18
@@ -652,9 +654,9 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker):
         aspect = height / max(1.0, width)
         if aspect < MIN_ASPECT_H_OVER_W:
             continue
-        candidate_angle = rect_angle_from_vertical(rect)
-        if candidate_angle > ANGLE_TOL_DEG:
-            continue
+        # candidate_angle = rect_angle_from_vertical(rect)
+        # if candidate_angle > ANGLE_TOL_DEG:
+        #     continue
         
         score = score_component(rect)
         if score > best_score:
@@ -672,17 +674,30 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker):
         cv2.drawContours(out, [box], 0, LANE_COLOR, 2)
         cv2.drawContours(mask_debug, [box], 0, (0, 255, 255), 2)
 
-        ys = box[:,1]
-        low = box[np.argsort(ys)][-2:]
-        line_x_bottom = float(np.mean(low[:,0]))
-        cv2.circle(out, (int(line_x_bottom), y_bottom-4), 5, (0,0,255), -1)
-        cv2.circle(mask_debug, (int(line_x_bottom), y_bottom-4), 5, (0,0,255), -1)
+        # --- OLD NEAR-SIGHTED MATH ---
+        # ys = box[:,1]
+        # low = box[np.argsort(ys)][-2:]
+        # line_x_bottom = float(np.mean(low[:,0]))
+        # cv2.circle(out, (int(line_x_bottom), y_bottom-4), 5, (0,0,255), -1)
+        # cv2.circle(mask_debug, (int(line_x_bottom), y_bottom-4), 5, (0,0,255), -1)
 
+        # --- NEW LOOK-AHEAD MATH ---
+        # best_rect format is: ((cx, cy), (width, height), angle)
+        (cx, cy) = best_rect[0]
+        
+        # We still call it line_x_bottom for variable compatibility, 
+        # but it is now tracking the center of the line!
+        line_x_bottom = float(cx) 
+        
+        # Draw the red dot in the center of the bounding box so you can see it working!
+        cv2.circle(out, (int(cx), int(cy)), 5, (0,0,255), -1)
+        cv2.circle(mask_debug, (int(cx), int(cy)), 5, (0,0,255), -1)
+        
         angle_deg = rect_angle_from_vertical(best_rect)
-        if angle_deg > 45.0:   # too diagonal — not a lane line, skip it
-            best_rect = None
-            line_x_bottom = None
-            angle_deg = None
+        # if angle_deg > 45.0:   # too diagonal — not a lane line, skip it
+        #     best_rect = None
+        #     line_x_bottom = None
+        #     angle_deg = None
 
     cv2.line(out, (0, y_top), (w-1, y_top), (255, 0, 0), 1, cv2.LINE_AA)
     cv2.line(mask_debug, (0, y_top), (w-1, y_top), (255, 0, 0), 1, cv2.LINE_AA)
