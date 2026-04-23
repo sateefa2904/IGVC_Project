@@ -79,12 +79,17 @@ STOP_CMD   = "Stop"
 # RIGHT_ENTER_THRESH =  0.06  
 # RIGHT_EXIT_THRESH  =  0.02
 
-LEFT_ENTER_THRESH  = -0.06  
-RIGHT_ENTER_THRESH =  0.06  
+# LEFT_ENTER_THRESH  = -0.06  
+# RIGHT_ENTER_THRESH =  0.06  
 
-# INCREASE the exit thresholds to stop turning earlier
-LEFT_EXIT_THRESH   = -0.04  # Was -0.02
-RIGHT_EXIT_THRESH  =  0.04  # Was 0.02
+# # INCREASE the exit thresholds to stop turning earlier
+# LEFT_EXIT_THRESH   = -0.04  # Was -0.02
+# RIGHT_EXIT_THRESH  =  0.04  # Was 0.02
+LEFT_ENTER_THRESH  = -0.05
+LEFT_EXIT_THRESH   = -0.02
+
+RIGHT_ENTER_THRESH =  0.05
+RIGHT_EXIT_THRESH  =  0.02
 
 
 
@@ -166,10 +171,10 @@ MIN_AREA             = 80 #old: 80
 MIN_HEIGHT           = 15 #old: 15
 MIN_WIDTH            = 2
 MIN_ASPECT_H_OVER_W  = 1 #old: 0.6,1.0
-ANGLE_TOL_DEG        = 45
+ANGLE_TOL_DEG        = 80
 
-CENTER_DEADBAND = 0.12
-DUAL_KP = 0.6 #0.9 
+CENTER_DEADBAND = 0.04
+DUAL_KP = 1.0 #0.6 #0.9 
 DUAL_KD = 0.4
 DUAL_U_THRESH = 0.18
 # Single-side: creep forward until line norm exceeds these, then turn away from that line.
@@ -990,7 +995,7 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
     # How many frames of camera loss we tolerate before switching modes.
     # At 33Hz, 5 frames = ~150ms — enough to absorb angle-filter glitches
     # but short enough to not delay curve response.
-    GLITCH_TOLERANCE = 5
+    GLITCH_TOLERANCE = 3
 
     print("[LANE PROCESS] started")
     while True:
@@ -1011,7 +1016,10 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
                 glitch_count = 0
 
                 current_center = (nL + nR) / 2.0
-                error = 0.5 - current_center
+                
+                # FIX: Swapped so steering matches the error polarity!
+                error = current_center - 0.5 
+                
                 de    = error - prev_e
                 prev_e = error
 
@@ -1026,7 +1034,6 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
                 shared["lane_turn"].value      = turn_val
                 shared["lane_visible_L"].value = True
                 shared["lane_visible_R"].value = True
-                print(f"[LANE] DUAL  | center={current_center:.2f} err={error:+.2f} turn={turn_val:+.2f}")
 
             # ------------------------------------------------
             # ONE camera: direct error → turn, no hold/blend
@@ -1034,59 +1041,22 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
             elif nL is not None or nR is not None:
 
                 if nL is not None:
-                    # Left line is visible.
-                    # nL is its normalized x position (0=left edge, 1=right edge).
-                    # If nL is RIGHT of target → robot has drifted left → steer right (+turn).
-                    # If nL is LEFT of target  → robot has drifted right → steer left (-turn).
                     err   = nL - TARGET_X_RATIO_LEFT
-                    # Use full DUAL_KP — the error itself is already small near center
-                    # and large on a real curve, so the gain doesn't need to be cut.
-                    turn_val = float(np.clip(-err * DUAL_KP, -0.8, 0.8))
+                    
+                    # FIX: Removed the negative sign
+                    turn_val = float(np.clip(err * DUAL_KP, -0.8, 0.8)) 
+                    
                     shared["lane_visible_L"].value = True
                     shared["lane_visible_R"].value = False
-                    print(f"[LANE] LEFT  | nL={nL:.2f} err={err:+.2f} turn={turn_val:+.2f}")
 
                 else:
                     err   = nR - TARGET_X_RATIO_RIGHT
-                    turn_val = float(np.clip(-err * DUAL_KP, -0.8, 0.8))
+                    
+                    # FIX: Removed the negative sign
+                    turn_val = float(np.clip(err * DUAL_KP, -0.8, 0.8)) 
+                    
                     shared["lane_visible_L"].value = False
                     shared["lane_visible_R"].value = True
-                    print(f"[LANE] RIGHT | nR={nR:.2f} err={err:+.2f} turn={turn_val:+.2f}")
-
-                glitch_count += 1
-
-                if glitch_count <= GLITCH_TOLERANCE:
-                    # Within glitch window: blend toward new reading so a single
-                    # bad frame from the angle filter doesn't cause a jerk.
-                    # blend_alpha=0 means "all last_turn", blend_alpha=1 means "all new"
-                    blend_alpha = glitch_count / GLITCH_TOLERANCE
-                    turn_val    = (1.0 - blend_alpha) * last_turn + blend_alpha * turn_val
-                    print(f"[LANE] blending α={blend_alpha:.1f} → {turn_val:+.2f}")
-
-                # After glitch window, turn_val is used directly — no cap, no delay.
-                # last_turn is NOT updated in single-cam mode so that if we re-acquire
-                # both cameras, the blend starts from the last dual-cam value.
-                turn_val = float(np.clip(turn_val, -1.0, 1.0))
-                shared["lane_turn"].value = turn_val
-
-            # ------------------------------------------------
-            # NO cameras: hold last turn briefly, then go straight
-            # ------------------------------------------------
-            else:
-                glitch_count += 1
-                prev_e = 0.0  # reset derivative — no spike when vision returns
-
-                if glitch_count <= GLITCH_TOLERANCE:
-                    # Hold the last known good value for a moment
-                    shared["lane_turn"].value = last_turn
-                    print(f"[LANE] BLIND | holding {last_turn:+.2f} ({glitch_count}/{GLITCH_TOLERANCE})")
-                else:
-                    # Extended blind — go straight, we have no information
-                    shared["lane_turn"].value = 0.0
-                    print(f"[LANE] BLIND | extended, going straight")
-
-                shared["lane_visible_L"].value = False
-                shared["lane_visible_R"].value = False
 
             # Debug overlay
             debug_view = np.hstack((out_L, out_R, mask_L, mask_R))
