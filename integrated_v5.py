@@ -74,10 +74,17 @@ STOP_CMD   = "Stop"
 # RIGHT_EXIT_THRESH  =  0.10  # Stop turning sooner
 
 # --- Update these constants at the top of your script ---
-LEFT_ENTER_THRESH  = -0.15  # React sooner (was -0.25)
-LEFT_EXIT_THRESH   = -0.05  # Stop turning much earlier to prevent overshoot (was -0.10)
-RIGHT_ENTER_THRESH =  0.15  # React sooner (was 0.25)
-RIGHT_EXIT_THRESH  =  0.05  # Stop turning much earlier (was 0.10)
+# LEFT_ENTER_THRESH  = -0.06  
+# LEFT_EXIT_THRESH   = -0.02  # Drops back to straight when almost centered
+# RIGHT_ENTER_THRESH =  0.06  
+# RIGHT_EXIT_THRESH  =  0.02
+
+LEFT_ENTER_THRESH  = -0.06  
+RIGHT_ENTER_THRESH =  0.06  
+
+# INCREASE the exit thresholds to stop turning earlier
+LEFT_EXIT_THRESH   = -0.04  # Was -0.02
+RIGHT_EXIT_THRESH  =  0.04  # Was 0.02
 
 
 
@@ -162,8 +169,8 @@ MIN_ASPECT_H_OVER_W  = 1 #old: 0.6,1.0
 ANGLE_TOL_DEG        = 90
 
 CENTER_DEADBAND = 0.07
-DUAL_KP = 0.7 #0.9 
-DUAL_KD = 0.3
+DUAL_KP = 0.6 #0.9 
+DUAL_KD = 0.4
 DUAL_U_THRESH = 0.18
 # Single-side: creep forward until line norm exceeds these, then turn away from that line.
 SINGLE_LEFT_DANGER_RATIO = 0.40
@@ -994,7 +1001,8 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
                 #current_center = (nL + nR) / 2.0
                 
                 #error = 0.5 - current_center
-                error = err_R - err_L
+                current_center = (nL + nR) / 2.0
+                error = 0.5 - current_center
                 de = error - prev_e
                 prev_e = error
                 
