@@ -1196,17 +1196,13 @@ def lidar_worker(shared):
 
 def run_full_integrated(mc, shared):
 
-    active_side = "LEFT"
-
-    state = "CAM_LANE_LEFT"
-    state_start_time = time.time()
-    corridor_origin = None
-
-    lost_frames = 0
-    steer_state = "STRAIGHT"
-
     last_completed_stop = time.time()
     stop_state_end_time = 0
+    steer_state = "STRAIGHT"  # Hysteresis state: "STRAIGHT", "LEFT", or "RIGHT"
+
+    # Tuned constants (moved here so they're easy to adjust)
+    AVOID_ZONE   = 450.0  # mm — was 800, reduced to avoid fighting the lane controller
+    MAX_REPULSION = 0.6   # was 0.8
 
     try:
         while True:
@@ -1216,202 +1212,99 @@ def run_full_integrated(mc, shared):
             # =========================
             # Read shared sensor data
             # =========================
-
-            dL = shared["dL"].value
-            dC = shared["dC"].value
-            dR = shared["dR"].value
-
+            dL  = shared["dL"].value
+            dC  = shared["dC"].value
+            dR  = shared["dR"].value
             dFL = shared["dFL"].value
             dF  = shared["dF"].value
             dFR = shared["dFR"].value
 
             lane_visible = shared["lane_visible_L"].value or shared["lane_visible_R"].value
-            turn = shared["lane_turn"].value
-            
+
             print(
                 f"L={fmt_mm(dL)}  C={fmt_mm(dC)}  R={fmt_mm(dR)}"
                 f"  |  FL={fmt_mm(dFL)}  F={fmt_mm(dF)}  FR={fmt_mm(dFR)}",
                 end="  "
             )
 
-            
-
             # =========================
             # Stop sign logic
             # =========================
-
             stop_event = shared["stop_event"].value
-            
+
             if now < stop_state_end_time:
                 mc.send(STOP_CMD)
+                time.sleep(0.05)
                 continue
-            # finished stopping → update cooldown
+
             if stop_state_end_time != 0 and now >= stop_state_end_time:
                 last_completed_stop = now
                 stop_state_end_time = 0
                 print("[STOP] Completed stop")
 
-            # trigger new stop
             if stop_event and (now - last_completed_stop > 10):
                 print("[STOP] Triggered")
                 stop_state_end_time = now + 8
-                shared["stop_event"].value = False  # consume event
+                shared["stop_event"].value = False
                 mc.send(STOP_CMD, force=True)
-                continue
-                
-            
-            # =========================
-            # LIDAR safety overrides
-            # =========================
-
-            if min(dL, dC, dR) < NEAR_OBS_TRIP:
-                mc.send(CMD_DOWN)
-                print("-> BACKOFF (NEAR obstacle)")
                 time.sleep(0.05)
                 continue
 
-            openL = dL >= THRESH_MAIN
-            openC = dC >= THRESH_MAIN
-            openR = dR >= THRESH_MAIN
-
-            left_blocked = not openL
-            right_blocked = not openR
-
-            cmd = STOP_CMD
+            # =========================
+            # 1. Lane turn value from camera
+            # =========================
+            lane_turn = shared["lane_turn"].value
 
             # =========================
-            # STATE MACHINE
+            # 2. LIDAR obstacle repulsion
             # =========================
+            left_dist  = min(dL, dFL)
+            right_dist = min(dR, dFR)
+            center_dist = min(dC, dF)
 
-            if left_blocked and right_blocked and not state.startswith("LIDAR_MIDDLE"):
+            obs_turn = 0.0
 
-                corridor_origin = active_side
+            if left_dist < AVOID_ZONE:
+                push = (AVOID_ZONE - left_dist) / AVOID_ZONE
+                obs_turn += push * MAX_REPULSION   # obstacle left → push right
 
-                print(f"[STATE] Entering LIDAR_MIDDLE from {corridor_origin}")
+            if right_dist < AVOID_ZONE:
+                push = (AVOID_ZONE - right_dist) / AVOID_ZONE
+                obs_turn -= push * MAX_REPULSION   # obstacle right → push left
 
-                steer_state = "STRAIGHT"
-                state = "LIDAR_MIDDLE_BALANCE"
-                state_start_time = now
-
-
-            if state == "LIDAR_MIDDLE_BALANCE":
-
-                if math.isinf(dL) or math.isinf(dR):
-                    cmd = STOP_CMD
-
+            if center_dist < AVOID_ZONE:
+                push = (AVOID_ZONE - center_dist) / AVOID_ZONE
+                if left_dist > right_dist:
+                    obs_turn -= push * MAX_REPULSION  # more room on left → swerve left
                 else:
+                    obs_turn += push * MAX_REPULSION  # more room on right → swerve right
 
-                    diff = dL - dR
+            # =========================
+            # 3. Blend lane + obstacle
+            # =========================
+            final_turn = float(np.clip(lane_turn + obs_turn, -1.0, 1.0))
 
-                    if abs(diff) <= CORRIDOR_BALANCE_EPS_MM and openC:
+            # =========================
+            # 4. Translate float → discrete TM4C command via hysteresis
+            # =========================
+            cmd, steer_state = choose_cmd_with_hysteresis(final_turn, steer_state)
 
-                        print("[STATE] Balanced -> LIDAR_MIDDLE_FORWARD")
-
-                        state = "LIDAR_MIDDLE_FORWARD"
-                        state_start_time = now
-                        cmd = CMD_UP
-
-                    else:
-
-                        if diff > CORRIDOR_BALANCE_EPS_MM:
-                            cmd = CMD_LEFT
-                        elif diff < -CORRIDOR_BALANCE_EPS_MM:
-                            cmd = CMD_RIGHT
-                        else:
-                            cmd = CMD_UP
-
-
-            elif state == "LIDAR_MIDDLE_FORWARD":
-
-                elapsed = now - state_start_time
-
-                if elapsed < CORRIDOR_FORWARD_TIME and openC:
-                    cmd = CMD_UP
-
-                else:
-
-                    print("[STATE] -> LIDAR_MIDDLE_EXIT_TURN")
-
-                    state = "LIDAR_MIDDLE_EXIT_TURN"
-                    state_start_time = now
-
-                    cmd = CMD_LEFT if corridor_origin == "LEFT" else CMD_RIGHT
-
-
-            elif state == "LIDAR_MIDDLE_EXIT_TURN":
-
-                elapsed = now - state_start_time
-
-                exit_cmd = CMD_LEFT if corridor_origin == "LEFT" else CMD_RIGHT
-
-                if elapsed < CORRIDOR_EXIT_TURN_TIME:
-                    cmd = exit_cmd
-
-                else:
-
-                    active_side = corridor_origin
-
-                    state = f"CAM_LANE_{active_side}"
-                    state_start_time = now
-                    cmd = CMD_UP
-
-
-            elif state.startswith("CAM_LANE"):
-
-                if lane_visible:
-                    lost_frames = 0
-
-                    if state == "CAM_LANE_LEFT":
-
-                        if left_blocked and not right_blocked:
-
-                            print("[STATE] Obstacle LEFT -> CHANGE_L2R")
-
-                            steer_state = "STRAIGHT"
-                            state = "CHANGE_L2R_TURN"
-                            state_start_time = now
-                            cmd = CMD_RIGHT
-
-                        else:
-
-                            cmd, steer_state = choose_cmd_with_hysteresis(turn, steer_state)
-
-                    else:
-
-                        if right_blocked and not left_blocked:
-
-                            print("[STATE] Obstacle RIGHT -> CHANGE_R2L")
-
-                            steer_state = "STRAIGHT"
-                            state = "CHANGE_R2L_TURN"
-                            state_start_time = now
-                            cmd = CMD_LEFT
-
-                        else:
-
-                            cmd, steer_state = choose_cmd_with_hysteresis(turn, steer_state)
-
-                else:
-
-                    lost_frames += 1
-
-                    if lost_frames >= LOST_FRAMES_THRESH:
-
-                        print("[STATE] Lane lost -> STOP")
-
-                        steer_state = "STRAIGHT"
-                        cmd = STOP_CMD
-
-                    else:
-
-                        cmd = STOP_CMD
-
+            # When in a gentle correction (inside hysteresis band), just go forward —
+            # don't send a pivot command for small errors.
+            if steer_state == "STRAIGHT":
+                cmd = CMD_UP
 
             mc.send(cmd)
 
-            print(f"-> state={state} cmd={cmd}")
+            # =========================
+            # Telemetry
+            # =========================
+            print(
+                f"Lane: {lane_turn:+.2f} | Obs: {obs_turn:+.2f} | "
+                f"Final: {final_turn:+.2f} | Steer: {steer_state} | CMD: {cmd}"
+            )
 
-            time.sleep(0.005)
+            time.sleep(0.05)   # 20 Hz — was 0.005 (200 Hz), which caused command spam
 
     finally:
         mc.send(STOP_CMD, force=True)
