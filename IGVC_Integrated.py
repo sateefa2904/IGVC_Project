@@ -28,6 +28,20 @@ POST_NEAR_CLEAR_MM = 672.0
 
 ENC_RE = re.compile(r"\[ENC\]\s+rpmL=([-+]?\d*\.?\d+)\s+rpmR=([-+]?\d*\.?\d+)\s+mph=([-+]?\d*\.?\d+)")
 
+# ---------------------------------------------------------------------------
+# Integrated / lane-follow tuning (edit here or override on the CLI)
+# ---------------------------------------------------------------------------
+# Blind pulse runs when only one lane line is visible: turn for TURN sec, then
+# Stop for WAIT sec. Larger turn = stronger correction; larger wait = more
+# spacing between pulses (slower average lateral motion).
+DEFAULT_BLIND_PULSE_TURN_SEC = 1.25
+DEFAULT_BLIND_PULSE_WAIT_SEC = 2.75
+# GentleTurnPacer (PWM) for lidar pivots: used heavily in lidar-only; in "all"
+# mode it is applied only when lidar overrides the camera command (see
+# run_camera_loop) so lane-follow pulses are not chopped into tiny bursts.
+DEFAULT_LIDAR_TURN_DUTY = 0.72
+DEFAULT_LIDAR_TURN_PERIOD = 0.55
+
 
 @dataclass
 class LidarSnapshot:
@@ -52,8 +66,18 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--dual-u-thresh", type=float, default=cam.DUAL_U_THRESH)
     ap.add_argument("--single-left-danger", type=float, default=cam.SINGLE_LEFT_DANGER_RATIO)
     ap.add_argument("--single-right-danger", type=float, default=cam.SINGLE_RIGHT_DANGER_RATIO)
-    ap.add_argument("--blind-pulse-turn-sec", type=float, default=cam.BLIND_PULSE_TURN_SEC)
-    ap.add_argument("--blind-pulse-wait-sec", type=float, default=cam.BLIND_PULSE_WAIT_SEC)
+    ap.add_argument(
+        "--blind-pulse-turn-sec",
+        type=float,
+        default=DEFAULT_BLIND_PULSE_TURN_SEC,
+        help="Seconds per turn phase when one line visible (lane blind pulse).",
+    )
+    ap.add_argument(
+        "--blind-pulse-wait-sec",
+        type=float,
+        default=DEFAULT_BLIND_PULSE_WAIT_SEC,
+        help="Seconds of Stop between turn phases (lane blind pulse).",
+    )
     ap.add_argument("--blind-turn-pulse", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--invert-steer", action="store_true")
     ap.add_argument("--lane-detector", choices=("fitline", "histogram"), default="fitline")
@@ -77,19 +101,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--lidar-gentle-turn",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Pulse Left/Right Half with brief stop (or forward) so turns are slower for the cameras.",
+        help="PWM-style Left/Right pacing for lidar pivots. In 'all' mode, lane-follow uses full "
+        "pulses; pacing runs only when lidar overrides steering.",
     )
     ap.add_argument(
         "--lidar-turn-duty",
         type=float,
-        default=0.42,
-        help="Fraction of each turn cycle spent commanding Left/Right Half (0..1). Lower = slower average pivot.",
+        default=DEFAULT_LIDAR_TURN_DUTY,
+        help="Fraction of each gentle-turn cycle on Left/Right (0..1). In 'all' mode, gentle PWM "
+        "applies only when lidar overrides the camera command.",
     )
     ap.add_argument(
         "--lidar-turn-period",
         type=float,
-        default=0.32,
-        help="Seconds per full gentle-turn cycle (on+off). Larger = smoother, slower corrections.",
+        default=DEFAULT_LIDAR_TURN_PERIOD,
+        help="Seconds per full gentle-turn cycle (on+off). Larger = longer on/off segments.",
     )
     ap.add_argument(
         "--lidar-turn-off-cmd",
@@ -362,7 +388,10 @@ def lidar_override_cmd(base_cmd: str, ls: LidarSnapshot) -> str:
             return cam.CMD_LEFT
         if ls.dR > ls.dL:
             return cam.CMD_RIGHT
-        return cam.CMD_STOP
+        # Ambiguous tie (left ~= right) used to force Stop, which made the
+        # integrated stack freeze whenever camera lost both lines. Keep the
+        # camera command so lane-reacquisition behavior can continue.
+        return base_cmd
     return base_cmd
 
 
@@ -540,8 +569,12 @@ def run_camera_loop(
 
             if lidar_shared is not None:
                 lsnap = get_lidar_snapshot(lidar_shared)
-                cmd = lidar_override_cmd(cmd, lsnap)
-                if lidar_turn_pacer is not None:
+                cmd_after_camera = cmd
+                cmd = lidar_override_cmd(cmd_after_camera, lsnap)
+                # Do not stack GentleTurnPacer on lane-follow Left/Right: that produced tiny
+                # effective pulses (duty × period) on top of blind-pulse timing. Pace only when
+                # lidar actually overrides the camera command.
+                if lidar_turn_pacer is not None and cmd != cmd_after_camera:
                     cmd = lidar_turn_pacer.pace(cmd, time.monotonic())
 
             cmd_motor = cam.apply_steer_inversion(cmd, args.invert_steer)
