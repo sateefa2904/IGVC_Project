@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 """
-Camera-only lane follower (default **--control-mode dual-center**): **left + right** cameras,
-white tape on each side; steer to stay centered, **Forward Half** when |error| is small.
+Dual-camera lane follower: **left + right** cameras, white tape on each side; steer to stay
+centered, **Forward Half** when |error| is small.
 
-Use ``--control-mode right-only`` for the previous **single RIGHT camera** behavior
-(fitline PD or histogram avoid-right-stripe).
-
-**--lane-detector fitline** (default): HLS mask, ROI, ``cv2.fitLine`` (and PD in right-only mode).
+**--lane-detector fitline** (default): HLS mask, ROI, ``cv2.fitLine``.
 **--lane-detector histogram**: column-sum peak + hysteresis.
 
-In dual-center, if only one side sees a line, the vehicle creeps forward until too close, then
-turns away until the other camera can see the other line.
+If only one side sees a line, the vehicle creeps forward until too close, then turns away until
+the other camera can see the other line.
 
-Use ``--show``, ``--http-preview-port``, or ``--preview-stills`` for debug. Dual preview: two rows
-(LEFT then RIGHT) or ``--dual-preview-layout wide``. By default ``--swap-lr-cameras`` maps USB
-``--right-index`` to the LEFT lane view and ``--left-index`` to the RIGHT (see help); use
-``--no-swap-lr-cameras`` if previews already match the vehicle. ``--http-single-cam-preview`` is only for
-right-only mode (dual-center needs both streams).
+Use ``--http-preview-port`` for browser preview. The panel is always two rows
+(LEFT then RIGHT). Camera mapping uses the proven default: stream opened as ``--right-index``
+is assigned to LEFT lane processing, and ``--left-index`` to RIGHT.
 
-Debug: telemetry each loop, optional OpenCV window, optional MJPEG HTTP preview, optional stills.
+Debug: telemetry each loop and optional MJPEG HTTP preview.
 """
 
 import argparse
-import os
 import signal
 import socketserver
 import sys
@@ -44,10 +38,6 @@ BAUD = 19200
 EOL = "\r"  # TM4C parser ends on c == 13
 BOOT_WAIT = 2.0
 CHAR_DELAY = 0.01
-# After sending Stop on exit: USB-UART buffers may still be draining; flush() does not always
-# wait for the last stop bit. Settle before closing the port so the TM4C sees a full "Stop\r".
-STOP_SHUTDOWN_BURST_TIMES = 2
-STOP_SHUTDOWN_SETTLE_SEC = 0.35
 
 CMD_FWD = "Forward Half"
 CMD_LEFT = "Left Half"
@@ -64,8 +54,8 @@ SHUTDOWN_IN_PROGRESS = False
 # ---------------------------
 # Camera settings
 # ---------------------------
-LEFT_CAM_INDEX = 0
-RIGHT_CAM_INDEX = 2
+LEFT_CAM_INDEX = 2
+RIGHT_CAM_INDEX = 0
 # V4L2 is Linux; DirectShow is typical on Windows.
 CAM_BACKEND = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2
 MIRROR_FRAME = False
@@ -73,8 +63,6 @@ MIRROR_FRAME = False
 # Opening two USB cameras on Linux/Jetson: the 2nd often fails without a pause; some
 # systems need retries or a different VideoCapture API. Tune via CLI if needed.
 CAM_SECOND_OPEN_DELAY_SEC = 0.85
-CAM_OPEN_RETRIES_PER_INDEX = 5
-CAM_RETRY_GAP_SEC = 0.35
 
 # Default capture (MJPEG); lower res/FPS helps two cameras on one USB hub.
 CAM_FRAME_WIDTH = 960
@@ -87,16 +75,14 @@ CAM_FRAME_FPS = 30
 # Full-frame ROI (used only if narrow_right_roi disabled)
 ROI_VERTICES_RATIO = dict(
     bottom_left=(0.05, 0.98),
-    top_left=(0.22, 0.60),
+    top_left=(0.22, 0.45),
     top_right=(0.78, 0.60),
     bottom_right=(0.95, 0.98),
 )
 
 # Right-lane search window: ignore left side of image so floor / far lane marks are not picked.
 RIGHT_LINE_ROI_X0_RATIO = 0.28
-RIGHT_LINE_ROI_X1_RATIO = 0.99
 RIGHT_LINE_ROI_Y0_RATIO = 0.42
-RIGHT_LINE_ROI_Y1_RATIO = 0.99
 # Bottom band (within ROI) used for column histogram — where the tape crosses the road plane
 LINE_HIST_BAND_H_RATIO = 0.14
 # Peak must stand out from median column sum (noise rejection)
@@ -114,18 +100,12 @@ CB_ABS_MAX = 14
 OPEN_K = (3, 3)
 CLOSE_K = (11, 11)
 
-# --- camera_part3.py style (fitLine + HLS mask + trapezoid ROI) ---
+# style (fitLine + HLS mask + trapezoid ROI) ---
 PART3_MIN_AREA = 300
 PART3_MIN_HEIGHT = 40
-PART3_MIN_WIDTH = 4
 PART3_MIN_ASPECT_H_OVER_W = 1.2
 PART3_HLS_L_MIN = 170
 PART3_HLS_S_MAX = 50
-# PD steering (same as camera_part3 SimpleLineTracker)
-PART3_KP = 0.9
-PART3_KD = 0.2
-PART3_TURN_LEFT_THRESH = -0.20
-PART3_TURN_RIGHT_THRESH = 0.20
 
 # ---------------------------
 # Right-lane avoid tuning (histogram + hysteresis)
@@ -154,18 +134,18 @@ MAX_CAM_RECOVERIES_PER_RUN = 15
 # Dual-camera center (between left + right lane lines)
 # ---------------------------
 # e = (nR - tgtR) - (nL - tgtL) with n = line_x / width. e > 0 => too far right in lane => steer LEFT.
-CENTER_DEADBAND = 0.07
-DUAL_KP = 1.05
-DUAL_KD = 0.18
-DUAL_U_THRESH = 0.18
+CENTER_DEADBAND = 0.20 # decrease to stop going straight earlier
+DUAL_KP = 0.90 # reduce if the vehicle snaps too hard when it starts turning
+DUAL_KD = 0.80 # if it swings past and rebounds, increase to dampen the swing
+DUAL_U_THRESH = 0.7 # increase to trigger a left/right turn sooner
 # Single-side: creep forward until line norm exceeds these, then turn away from that line.
-SINGLE_LEFT_DANGER_RATIO = 0.52
-SINGLE_RIGHT_DANGER_RATIO = 0.52
+SINGLE_LEFT_DANGER_RATIO = 0.40
+SINGLE_RIGHT_DANGER_RATIO = 0.50
 # When not BOTH and steering wants Left/Right: turn briefly, then Stop so cameras can update.
-BLIND_PULSE_TURN_SEC = 1.0
+BLIND_PULSE_TURN_SEC = 0.8
 BLIND_PULSE_WAIT_SEC = 2.0
 
-
+# White mask settings 
 def white_mask(bgr: np.ndarray, hsv_v_min: int = HSV_V_MIN) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2Lab)
@@ -185,7 +165,7 @@ def white_mask(bgr: np.ndarray, hsv_v_min: int = HSV_V_MIN) -> np.ndarray:
 
     return ((m_hsv & m_lab & m_ycc).astype(np.uint8)) * 255
 
-
+# Morphological cleaning 
 def morph_clean(mask: np.ndarray) -> np.ndarray:
     open_k = cv2.getStructuringElement(cv2.MORPH_RECT, OPEN_K)
     close_k = cv2.getStructuringElement(cv2.MORPH_RECT, CLOSE_K)
@@ -193,7 +173,7 @@ def morph_clean(mask: np.ndarray) -> np.ndarray:
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, close_k)
     return m
 
-
+# Draw lane reference markers   
 def draw_lane_reference_markers(
     overlay: np.ndarray,
     mask_dbg: np.ndarray,
@@ -232,7 +212,7 @@ def draw_lane_reference_markers(
     cv2.line(mask_dbg, (tx_tgt, y_top), (tx_tgt, y_bottom), (0, 255, 0), gt, cv2.LINE_AA)
 
 
-def region_selection_binary(mask_u8: np.ndarray) -> np.ndarray:
+def region_selection_binary(mask_u8: np.ndarray) -> np.ndarray: 
     """Apply trapezoid ROI to a 2D binary mask (same geometry as camera_part3)."""
     h, w = mask_u8.shape[:2]
     poly = np.zeros_like(mask_u8)
@@ -257,7 +237,7 @@ def region_selection_binary(mask_u8: np.ndarray) -> np.ndarray:
     return cv2.bitwise_and(mask_u8, poly)
 
 
-def white_mask_hls(
+def white_mask_hls( # HLS lightness + low saturation picks white tape.
     bgr: np.ndarray, l_min: int = PART3_HLS_L_MIN, s_max: int = PART3_HLS_S_MAX
 ) -> np.ndarray:
     """camera_part3: HLS lightness + low saturation picks white tape."""
@@ -266,7 +246,7 @@ def white_mask_hls(
     return ((l_ch > l_min) & (s_ch < s_max)).astype(np.uint8) * 255
 
 
-def detect_line_x_fitline(
+def detect_line_x_fitline( 
     frame_bgr: np.ndarray,
     l_min: int = PART3_HLS_L_MIN,
     s_max: int = PART3_HLS_S_MAX,
@@ -324,29 +304,7 @@ def detect_line_x_fitline(
     tag = "fitline_ok" if line_x_bottom is not None else "fitline_none"
     return line_x_bottom, mask_white, tag
 
-
-class SimpleLineTracker:
-    """camera_part3 PD on normalized error vs target column."""
-
-    def __init__(self, w: int, target_x_ratio: float):
-        self.w = w
-        self.target_x_ratio = target_x_ratio
-        self.prev_err = 0.0
-
-    def control_from_x(self, line_x_bottom: Optional[float]) -> Tuple[float, float]:
-        target_x = self.target_x_ratio * self.w
-        if line_x_bottom is None:
-            err_norm = 0.0
-        else:
-            err_px = float(line_x_bottom) - target_x
-            err_norm = float(np.clip(err_px / (self.w / 2), -1.0, 1.0))
-        d = err_norm - self.prev_err
-        self.prev_err = err_norm
-        u = PART3_KP * err_norm + PART3_KD * d
-        u = float(np.clip(u, -1.0, 1.0))
-        return u, err_norm
-
-
+# Horizontal band for column histogram: ``right`` = right lane line; ``left`` = left lane line.
 def _lane_search_roi_slice(
     h: int, w: int, roi_side: str = "right"
 ) -> Tuple[int, int, int, int]:
@@ -361,7 +319,7 @@ def _lane_search_roi_slice(
         x1 = w
     return x0, x1, y0, y1
 
-
+# Lane stripe x from column sum in a left or right ROI.
 def detect_line_x_histogram(
     frame_bgr: np.ndarray,
     hsv_v_min: int = HSV_V_MIN,
@@ -415,26 +373,7 @@ def detect_line_x_histogram(
     line_x = float(np.clip(x0 + x_f, 0.0, float(w - 1)))
     return line_x, full_bin, "ok"
 
-
-def choose_avoid_right_stripe(
-    x_norm: float,
-    steer_state: str,
-    enter_ratio: float,
-    exit_ratio: float,
-) -> Tuple[str, str]:
-    """
-    x_norm = line_x / width. Stripe far right (high x_norm) => too close to tape => turn left.
-    Hysteresis avoids oscillating between FWD and LEFT at the threshold.
-    """
-    if steer_state == "LEFT":
-        if x_norm <= exit_ratio:
-            return CMD_FWD, "STRAIGHT"
-        return CMD_LEFT, "LEFT"
-    if x_norm >= enter_ratio:
-        return CMD_LEFT, "LEFT"
-    return CMD_FWD, "STRAIGHT"
-
-
+# Open serial port and set DTR and RTS (DTR: Data Terminal Ready, RTS: Request to Send)
 def open_serial(port: str, baud: int) -> serial.Serial:
     ser = serial.Serial(
         port,
@@ -453,15 +392,15 @@ def open_serial(port: str, baud: int) -> serial.Serial:
     time.sleep(BOOT_WAIT)
     return ser
 
-
-def send_line_typewriter(ser: serial.Serial, text: str):
+# Send line typewriter (Send a single command string, wait a bit, then send it again)
+def send_line_typewriter(ser: serial.Serial, text: str): 
     data = (text + EOL).encode("ascii", errors="ignore")
     for b in data:
         ser.write(bytes([b]))
         ser.flush()
         time.sleep(CHAR_DELAY)
 
-
+# MotorCommander class (Send commands to the motor controller)
 class MotorCommander:
     def __init__(self, ser: serial.Serial, min_cmd_interval: float = 0.08):
         self.ser = ser
@@ -478,7 +417,7 @@ class MotorCommander:
             self.last_cmd = cmd
             self.last_send_time = now
 
-
+# Best-effort redundant stop path: 1) high-level forced command 2) raw serial fallback (twice)
 def force_stop_motors(mc, ser):
     # Best-effort redundant stop path:
     # 1) high-level forced command
@@ -500,7 +439,7 @@ def force_stop_motors(mc, ser):
     except Exception as e:
         print(f"[WARN] raw serial stop failed: {e}")
 
-
+# Emergency shutdown (Ctrl+C)
 def emergency_shutdown(signum, frame):
     del frame
     global SHUTDOWN_IN_PROGRESS
@@ -510,29 +449,26 @@ def emergency_shutdown(signum, frame):
     SHUTDOWN_IN_PROGRESS = True
     print(f"\n[SIGNAL] Caught signal {signum}, attempting safe stop...")
 
-    try:
+    try: # Try to stop the motors
         force_stop_motors(GLOBAL_MC, GLOBAL_SER)
     except Exception:
         pass
 
-    try:
+    try: # Try to release the cameras
         for side_cap in GLOBAL_CAPS.values():
             if side_cap is not None:
                 side_cap.release()
     except Exception:
         pass
 
-    # Leave GLOBAL_SER open here so a final force_stop in main's `finally` can run; closing too
-    # early can truncate the typewriter "Stop\r" and leave the MCU with a half-line / wrong tower.
-
-    try:
+    try: # Try to destroy the windows
         cv2.destroyAllWindows()
     except Exception:
         pass
 
     raise SystemExit(0)
 
-
+# Backend order to try when opening /dev/videoN (Linux often needs V4L2 then fallback).
 def _video_capture_backends():
     """Backend order to try when opening /dev/videoN (Linux often needs V4L2 then fallback)."""
     if sys.platform == "win32":
@@ -552,7 +488,7 @@ def _video_capture_backends():
         uniq.append(b)
     return uniq
 
-
+# Open a camera by index (Linux often needs V4L2 then fallback).
 def open_camera(
     index: int,
     label: str,
@@ -560,16 +496,16 @@ def open_camera(
     height: int = CAM_FRAME_HEIGHT,
     fps: int = CAM_FRAME_FPS,
 ) -> Optional[cv2.VideoCapture]:
-    for api in _video_capture_backends():
+    for api in _video_capture_backends(): # Try to open the camera with the available backends
         try:
-            if api is None:
+            if api is None: # If the backend is None, use the default VideoCapture
                 cap = cv2.VideoCapture(index)
             else:
-                cap = cv2.VideoCapture(index, api)
-        except Exception:
+                cap = cv2.VideoCapture(index, api) # If the backend is not None, use the backend
+        except Exception: 
             continue
         time.sleep(0.12)
-        if not cap.isOpened():
+        if not cap.isOpened(): # If the camera is not opened, try to release it
             try:
                 cap.release()
             except Exception:
@@ -582,10 +518,10 @@ def open_camera(
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
             cap.set(cv2.CAP_PROP_FPS, float(fps))
             ret, _ = cap.read()
-            if not ret:
+            if not ret: # If the camera is not read, try to release it
                 cap.release()
                 continue
-        except Exception:
+        except Exception: # If the camera is not read, try to release it
             try:
                 cap.release()
             except Exception:
@@ -593,7 +529,7 @@ def open_camera(
             continue
 
         api_tag = "default" if api is None else str(api)
-        print(
+        print( # Print the camera information
             f"[CAM] Using {label} camera index={index} (backend={api_tag}) "
             f"{width}x{height}@{fps}"
         )
@@ -602,7 +538,7 @@ def open_camera(
     print(f"[CAM] Failed to open {label} camera at index {index} (all backends)")
     return None
 
-
+# 
 def print_camera_troubleshooting():
     print(
         "[CAM] Second camera not available. Common causes on Jetson/Linux:\n"
@@ -613,32 +549,13 @@ def print_camera_troubleshooting():
         "  • Another process may hold the device: close other camera apps."
     )
 
-
+# Capture dimensions for LEFT or RIGHT; right may use smaller WxH to save USB bandwidth.
 def capture_dims(args, side: str) -> Tuple[int, int, int]:
-    """(width, height, fps) for LEFT or RIGHT; right may use smaller WxH to save USB bandwidth."""
-    w, h = args.cam_width, args.cam_height
-    if (
-        side == "RIGHT"
-        and getattr(args, "right_cam_width", 0) > 0
-        and getattr(args, "right_cam_height", 0) > 0
-    ):
-        w, h = args.right_cam_width, args.right_cam_height
-    return w, h, int(args.cam_fps)
+    """(width, height, fps) for both LEFT and RIGHT streams."""
+    del side
+    return args.cam_width, args.cam_height, int(args.cam_fps)
 
-
-def parse_indices_csv(text: str) -> List[int]:
-    out = []
-    for part in text.split(","):
-        p = part.strip()
-        if not p:
-            continue
-        try:
-            out.append(int(p))
-        except ValueError:
-            continue
-    return out
-
-
+# Unique indices
 def uniq_indices(indices: List[int]) -> List[int]:
     seen = set()
     out = []
@@ -649,69 +566,34 @@ def uniq_indices(indices: List[int]) -> List[int]:
         out.append(i)
     return out
 
-
+# Open a side camera with fallback (Open a camera by index (Linux often needs V4L2 then fallback).)
 def open_side_camera_with_fallback(
-    side: str,
-    preferred_index: int,
-    scan_indices: List[int],
-    avoid_index: Optional[int] = None,
-    width: int = CAM_FRAME_WIDTH,
-    height: int = CAM_FRAME_HEIGHT,
+    side: str, # LEFT or RIGHT
+    preferred_index: int, # The preferred index to open
+    scan_indices: List[int], # The indices to scan
+    avoid_index: Optional[int] = None, # Avoid the index of the other camera
+    width: int = CAM_FRAME_WIDTH, # The width of the camera
+    height: int = CAM_FRAME_HEIGHT, # The height of the camera
     fps: int = CAM_FRAME_FPS,
-) -> Tuple[Optional[cv2.VideoCapture], Optional[int]]:
+) -> Tuple[Optional[cv2.VideoCapture], Optional[int]]: # Return the camera and the index
     candidates = [preferred_index] + scan_indices
-    candidates = uniq_indices(candidates)
+    candidates = uniq_indices(candidates) 
     if avoid_index is not None:
         candidates = [i for i in candidates if i != avoid_index]
-
+    # Try to open the camera with the available indices
     for idx in candidates:
         cap = open_camera(idx, side, width, height, fps)
-        if cap is not None:
+        if cap is not None: # If the camera is opened, return the camera and the index
             return cap, idx
-    return None, None
+    return None, None # If the camera is not opened, return None
 
-
-def initialize_right_lane_camera(args, scan_indices):
-    """Open a single capture device: the RIGHT-side lane camera."""
-    rw, rh, rf = capture_dims(args, "RIGHT")
-    cap, idx = open_side_camera_with_fallback(
-        "RIGHT",
-        preferred_index=args.right_index,
-        scan_indices=scan_indices,
-        avoid_index=None,
-        width=rw,
-        height=rh,
-        fps=rf,
-    )
-    if cap is None:
-        return None, None
-    return {"RIGHT": cap}, {"RIGHT": idx}
-
-
-def initialize_optional_left_preview_camera(
-    args, scan_indices: List[int], avoid_index: Optional[int]
-) -> Tuple[Optional[cv2.VideoCapture], Optional[int]]:
-    """Second USB camera for debug only (same resolution as --cam-width/--cam-height)."""
-    w, h, fps = args.cam_width, args.cam_height, int(args.cam_fps)
-    return open_side_camera_with_fallback(
-        "LEFT",
-        preferred_index=args.left_index,
-        scan_indices=scan_indices,
-        avoid_index=avoid_index,
-        width=w,
-        height=h,
-        fps=fps,
-    )
-
-
+# Initialize the dual lane cameras (Open RIGHT index first, then LEFT index (pause between))
 def initialize_dual_lane_cameras(args, scan_indices: List[int]):
     """
     Open RIGHT index first, then LEFT index (pause between) for dual-lane centering. Both required.
 
-    By default (``--swap-lr-cameras``, on) the VideoCapture opened with ``--right-index`` is wired to
-    **LEFT** lane detection and ``--left-index`` to **RIGHT**, because USB enumeration order often
-    does not match physical mounting. Disable with ``--no-swap-lr-cameras`` if your indices already
-    match left/right lenses.
+    The VideoCapture opened with ``--right-index`` is wired to **LEFT** lane detection and
+    ``--left-index`` to **RIGHT**. This matches the physical camera layout used on this robot.
     """
     rw, rh, rf = capture_dims(args, "RIGHT")
     cap_r, idx_r = open_side_camera_with_fallback(
@@ -742,11 +624,9 @@ def initialize_dual_lane_cameras(args, scan_indices: List[int]):
         except Exception:
             pass
         return None, None
-    if args.swap_lr_cameras:
-        return {"LEFT": cap_r, "RIGHT": cap_l}, {"LEFT": idx_r, "RIGHT": idx_l}
-    return {"LEFT": cap_l, "RIGHT": cap_r}, {"LEFT": idx_l, "RIGHT": idx_r}
+    return {"LEFT": cap_r, "RIGHT": cap_l}, {"LEFT": idx_r, "RIGHT": idx_l}
 
-
+# Classify the lane visibility (BOTH: both lines are visible, LEFT_ONLY: only left line is visible, RIGHT_ONLY: only right line is visible, NONE: no lines are visible)
 def classify_lane_visibility(
     line_L: Optional[float], line_R: Optional[float],
 ) -> str:
@@ -760,60 +640,60 @@ def classify_lane_visibility(
         return "RIGHT_ONLY"
     return "NONE"
 
-
+# Center error for both lanes (Positive => vehicle too far right in lane => steer left to correct.)
 def center_error_both(nL: float, nR: float, tgtL: float, tgtR: float) -> float:
     """Positive => vehicle too far right in lane => steer left to correct."""
     return (nR - tgtR) - (nL - tgtL)
 
-
+# Choose the steering command (BOTH: PD-like u on center error; |e| small => forward. ONE SIDE: forward until visible line norm exceeds danger ratio, then turn away from that line; creep forward otherwise until the other camera picks up the other line. NONE: stop (dual-center main loop overrides: coast last Left/Right until a line returns).)
 def choose_steering_dual_center(
     vis: str,
-    e: float,
-    de: float,
-    nL: Optional[float],
-    nR: Optional[float],
-    danger_L: float,
-    danger_R: float,
-    center_db: float,
-    u_thresh: float,
-) -> Tuple[str, str]:
+    e: float, # Center error
+    de: float, # Center error derivative    
+    nL: Optional[float], # Line norm for left lane
+    nR: Optional[float], # Line norm for right lane
+    danger_L: float, # Danger ratio for left lane
+    danger_R: float, # Danger ratio for right lane
+    center_db: float, # Center deadband
+    u_thresh: float, # Threshold for PD-like u
+) -> Tuple[str, str]: # Return the steering command and the logic
     """
     BOTH: PD-like u on center error; |e| small => forward.
     ONE SIDE: forward until visible line norm exceeds danger ratio, then turn away from that line;
     creep forward otherwise until the other camera picks up the other line.
     NONE: stop (dual-center main loop overrides: coast last Left/Right until a line returns).
     """
-    if vis == "BOTH":
+    if vis == "BOTH": # If both lines are visible, use PD-like u on center error
         u = DUAL_KP * e + DUAL_KD * de
         u = float(np.clip(u, -1.0, 1.0))
-        if abs(e) < center_db:
+        if abs(e) < center_db: # If the center error is small, go forward
             return CMD_FWD, "CENTER_FWD"
-        if u > u_thresh:
+        if u > u_thresh: # If the u is positive, steer left
             return CMD_LEFT, "DUAL_L"
-        if u < -u_thresh:
+        if u < -u_thresh: # If the u is negative, steer right   
             return CMD_RIGHT, "DUAL_R"
         return CMD_FWD, "CENTER_FWD"
-    if vis == "LEFT_ONLY":
+    if vis == "LEFT_ONLY": # If only the left line is visible, creep forward until the visible line norm exceeds danger ratio
         assert nL is not None
-        if nL >= danger_L:
+        if nL >= danger_L: # If the visible line norm exceeds danger ratio, turn away from the left line
             return CMD_RIGHT, "AWAY_LEFT_LINE"
         return CMD_FWD, "CREEP_LEFT"
-    if vis == "RIGHT_ONLY":
+    if vis == "RIGHT_ONLY": # If only the right line is visible, creep forward until the visible line norm exceeds danger ratio
         assert nR is not None
-        if nR >= danger_R:
+        if nR >= danger_R: # If the visible line norm exceeds danger ratio, turn away from the right line
             return CMD_LEFT, "AWAY_RIGHT_LINE"
         return CMD_FWD, "CREEP_RIGHT"
-    return CMD_STOP, "LOST"
+    return CMD_STOP, "LOST" # If no lines are visible, stop
 
-
+# Apply the blind turn pulse (If ``vis != BOTH`` and the controller wants Left/Right, alternate: turn for ``turn_sec``, then Stop for ``wait_sec``, repeating until BOTH is visible again. Reduces over-correction when vision lags the vehicle.)
 def apply_blind_turn_pulse(
     st: "ControllerState",
-    vis: str,
-    desired_cmd: str,
+    vis: str, # Lane visibility
+    desired_cmd: str, # Desired command
     logic: str,
-    now_mono: float,
-    turn_sec: float,
-    wait_sec: float,
+    now_mono: float, # Current time in seconds
+    turn_sec: float, # Time to turn in seconds
+    wait_sec: float, # Time to wait in seconds
     enabled: bool,
 ) -> Tuple[str, str]:
     """
@@ -821,18 +701,18 @@ def apply_blind_turn_pulse(
     then Stop for ``wait_sec``, repeating until BOTH is visible again. Reduces over-correction when
     vision lags the vehicle.
     """
-    if not enabled or vis == "BOTH":
+    if not enabled or vis == "BOTH": # If the lane visibility is BOTH, stop the blind turn pulse
         st.blind_pulse_until = 0.0
         return desired_cmd, logic
 
-    if desired_cmd not in (CMD_LEFT, CMD_RIGHT):
+    if desired_cmd not in (CMD_LEFT, CMD_RIGHT): # If the desired command is not Left or Right, stop the blind turn pulse
         st.blind_pulse_until = 0.0
         return desired_cmd, logic
 
-    if st.blind_pulse_until <= 0.0 or now_mono >= st.blind_pulse_until:
+    if st.blind_pulse_until <= 0.0 or now_mono >= st.blind_pulse_until: # If the blind turn pulse is not active, start the blind turn pulse
         if st.blind_pulse_until <= 0.0:
             st.blind_in_turn_phase = True
-        else:
+        else: # If the blind turn pulse is active, toggle the turn phase
             st.blind_in_turn_phase = not st.blind_in_turn_phase
         dur = turn_sec if st.blind_in_turn_phase else wait_sec
         st.blind_pulse_until = now_mono + float(dur)
@@ -841,7 +721,7 @@ def apply_blind_turn_pulse(
         return desired_cmd, f"{logic}|PULSE_TURN"
     return CMD_STOP, f"{logic}|PULSE_WAIT"
 
-
+# Try to recover one camera (Release and reopen one VideoCapture after V4L2 stops delivering frames (errno 19, stale reads). Tries the last known index first, then scan_indices (same as cold start).)
 def try_recover_one_camera(
     caps: dict,
     used_idxs: dict,
@@ -892,17 +772,17 @@ def try_recover_one_camera(
     print(f"[CAM] Recover OK: {side} now on index={used_idxs[side]}")
     return True
 
-
+# Process a frame for histogram lane detection (Left or right ROI + histogram stripe finder. Overlay draws search ROI, reference lines, and detected x. err_norm is (x - target) / (w/2) for telemetry.)
 def process_frame_histogram(
     frame_bgr: np.ndarray,
-    target_ratio: float,
-    turn_enter_ratio: float,
-    turn_exit_ratio: float,
-    hsv_v_min: int = HSV_V_MIN,
-    lane_roi_side: str = "right",
-    green_line_thickness: int = 5,
-    target_goal_band_ratio: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray, Optional[float], float, str]:
+    target_ratio: float, # Target ratio
+    turn_enter_ratio: float, # Turn enter ratio
+    turn_exit_ratio: float, # Turn exit ratio
+    hsv_v_min: int = HSV_V_MIN, # HSV V min
+    lane_roi_side: str = "right", # Lane ROI side
+    green_line_thickness: int = 5, # Green line thickness
+    target_goal_band_ratio: float = 0.0, # Target goal band ratio
+) -> Tuple[np.ndarray, np.ndarray, Optional[float], float, str]: # Return the overlay, mask, line x, error norm, and detection tag
     """
     Left or right ROI + histogram stripe finder. Overlay draws search ROI, reference lines,
     and detected x. err_norm is (x - target) / (w/2) for telemetry.
@@ -962,18 +842,18 @@ def process_frame_histogram(
 
     return overlay, mask_dbg, line_x_bottom, err_norm, det_tag
 
-
+# Process a frame for fitline lane detection (HLS mask + fitLine x + same reference lines as histogram mode.)
 def process_frame_fitline(
     frame_bgr: np.ndarray,
-    target_ratio: float,
-    turn_enter_ratio: float,
-    turn_exit_ratio: float,
-    hls_l_min: int = PART3_HLS_L_MIN,
-    hls_s_max: int = PART3_HLS_S_MAX,
-    lane_roi_side: str = "right",
-    green_line_thickness: int = 5,
-    target_goal_band_ratio: float = 0.0,
-) -> Tuple[np.ndarray, np.ndarray, Optional[float], float, str]:
+    target_ratio: float, # Target ratio
+    turn_enter_ratio: float, # Turn enter ratio
+    turn_exit_ratio: float, # Turn exit ratio
+    hls_l_min: int = PART3_HLS_L_MIN, # HLS L min
+    hls_s_max: int = PART3_HLS_S_MAX, # HLS S max
+    lane_roi_side: str = "right", # Lane ROI side
+    green_line_thickness: int = 5, # Green line thickness
+    target_goal_band_ratio: float = 0.0, # Target goal band ratio
+) -> Tuple[np.ndarray, np.ndarray, Optional[float], float, str]: # Return the overlay, mask, line x, error norm, and detection tag
     """camera_part3 visualization: HLS mask + fitLine x + same reference lines as histogram mode."""
     h, w = frame_bgr.shape[:2]
     y_bottom = h - 1
@@ -1036,7 +916,7 @@ def process_frame_fitline(
 
     return overlay, mask_dbg, line_x_bottom, err_norm, det_tag
 
-
+# Process a frame for lane detection (Fitline or histogram mode.)
 def process_frame(
     frame_bgr: np.ndarray,
     lane_detector: str,
@@ -1073,38 +953,11 @@ def process_frame(
         target_goal_band_ratio=target_goal_band_ratio,
     )
 
-
-def choose_part3_pd_cmd(
-    pd_u: float, right_lane_semantics: bool = True
-) -> Tuple[str, str]:
-    """
-    Map PD ``pd_u`` to discrete drive commands.
-
-    **Default (right_lane_semantics=True):** matches this program's right-lane goal — positive
-    ``pd_u`` means the stripe is to the **right** of the target column (too close to the tape)
-    ⇒ **Left Half**. Negative ⇒ **Right Half**. This is the opposite motor pairing from raw
-    ``camera_part3.py`` lane-follow, which was written for a different vehicle/convention.
-
-    Use ``right_lane_semantics=False`` (``--legacy-part3-pd-steering``) to restore camera_part3
-    Left/Right pairing if your hardware was tuned for that script.
-    """
-    if right_lane_semantics:
-        if pd_u > PART3_TURN_RIGHT_THRESH:
-            return CMD_LEFT, "PD_L"
-        if pd_u < PART3_TURN_LEFT_THRESH:
-            return CMD_RIGHT, "PD_R"
-    else:
-        if pd_u > PART3_TURN_RIGHT_THRESH:
-            return CMD_RIGHT, "PD_R"
-        if pd_u < PART3_TURN_LEFT_THRESH:
-            return CMD_LEFT, "PD_L"
-    return CMD_FWD, "PD_FWD"
-
-
+# Smooth the line x (EMA on bottom line x with per-frame jump limit (reduces zig-zag when the detector locks onto different parts of the lane or noise).)
 def smooth_line_x_ema(
-    prev: Optional[float],
-    meas: Optional[float],
-    w: int,
+    prev: Optional[float], # Previous line x
+    meas: Optional[float], # Measured line x
+    w: int, # Width
     alpha: float = LINE_X_EMA_ALPHA,
     max_jump_frac: float = LINE_X_MAX_JUMP_FRAC,
 ) -> Optional[float]:
@@ -1122,11 +975,9 @@ def smooth_line_x_ema(
     m = prev_f + float(np.clip(m - prev_f, -max_jump, max_jump))
     return alpha * m + (1.0 - alpha) * prev_f
 
-
+# Controller state (Last command, line x EMA, center error, lost both frames, read phase, last lateral command, blind pulse until, blind in turn phase.)
 @dataclass
 class ControllerState:
-    steer_state: str = "STRAIGHT"
-    lost_frames: int = 0
     last_cmd: str = CMD_STOP
     line_right_ema: Optional[float] = None
     line_left_ema: Optional[float] = None
@@ -1137,7 +988,7 @@ class ControllerState:
     blind_pulse_until: float = 0.0
     blind_in_turn_phase: bool = True
 
-
+# Latest JPEG for HTTP MJPEG clients (thread-safe).
 class MjpegPreviewState:
     """Latest JPEG for HTTP MJPEG clients (thread-safe)."""
 
@@ -1155,7 +1006,7 @@ class MjpegPreviewState:
         with self.lock:
             return self.jpeg_bytes
 
-
+# Make a MJPEG handler (HTTP handler for MJPEG preview.)
 def make_mjpeg_handler(preview: MjpegPreviewState):
     boundary = b"--jpgboundary"
 
@@ -1210,7 +1061,7 @@ def make_mjpeg_handler(preview: MjpegPreviewState):
 
     return Handler
 
-
+# Start a MJPEG server (Start a thread to serve MJPEG preview on the given host and port.)
 def start_mjpeg_server(
     preview: MjpegPreviewState, host: str, port: int
 ) -> Optional[socketserver.TCPServer]:
@@ -1228,7 +1079,7 @@ def start_mjpeg_server(
     )
     return server
 
-
+# Apply steer inversion (Invert the steering command if the invert flag is set.)
 def apply_steer_inversion(cmd: str, invert: bool) -> str:
     if not invert:
         return cmd
@@ -1238,43 +1089,7 @@ def apply_steer_inversion(cmd: str, invert: bool) -> str:
         return CMD_LEFT
     return cmd
 
-
-def build_debug_panel(
-    frame_left: np.ndarray,
-    frame_right: np.ndarray,
-    left_mask_dbg: np.ndarray,
-    right_mask_dbg: np.ndarray,
-    left_overlay: np.ndarray,
-    right_overlay: np.ndarray,
-    caption: str,
-    thumb_w: int = 320,
-    thumb_h: int = 180,
-) -> np.ndarray:
-    left_raw = cv2.resize(frame_left, (thumb_w, thumb_h))
-    left_mask = cv2.resize(left_mask_dbg, (thumb_w, thumb_h))
-    left_ov = cv2.resize(left_overlay, (thumb_w, thumb_h))
-    right_raw = cv2.resize(frame_right, (thumb_w, thumb_h))
-    right_mask = cv2.resize(right_mask_dbg, (thumb_w, thumb_h))
-    right_ov = cv2.resize(right_overlay, (thumb_w, thumb_h))
-    stacked = np.vstack(
-        (
-            np.hstack((left_raw, left_mask, left_ov)),
-            np.hstack((right_raw, right_mask, right_ov)),
-        )
-    )
-    cv2.putText(
-        stacked,
-        caption,
-        (10, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (50, 255, 50),
-        2,
-        cv2.LINE_AA,
-    )
-    return stacked
-
-
+# Build a single camera debug panel (Build a single camera debug panel: raw|mask|overlay with caption.)
 def build_single_cam_debug_panel(
     frame: np.ndarray,
     mask_dbg: np.ndarray,
@@ -1299,7 +1114,7 @@ def build_single_cam_debug_panel(
     )
     return row
 
-
+# Build a dual camera debug panel (Two rows: LEFT (top) then RIGHT (bottom), each raw|mask|overlay — best for browser scrolling.)
 def build_dual_cam_debug_panel(
     top_frame: np.ndarray,
     top_mask_dbg: np.ndarray,
@@ -1326,85 +1141,10 @@ def build_dual_cam_debug_panel(
         row2 = cv2.resize(row2, (w, int(row2.shape[0] * w / row2.shape[1])))
     return np.vstack((row1, row2))
 
-
-def build_dual_cam_debug_panel_side_by_side(
-    left_frame: np.ndarray,
-    left_mask_dbg: np.ndarray,
-    left_overlay: np.ndarray,
-    left_caption: str,
-    right_frame: np.ndarray,
-    right_mask_dbg: np.ndarray,
-    right_overlay: np.ndarray,
-    right_caption: str,
-    thumb_w: int = 384,
-    thumb_h: int = 216,
-) -> np.ndarray:
-    """
-    One row: [LEFT raw|mask|ov] [RIGHT raw|mask|ov] so both cameras fit in a browser
-    without vertical scrolling (MJPEG / remote viewing).
-    """
-    row_l = build_single_cam_debug_panel(
-        left_frame, left_mask_dbg, left_overlay, left_caption, thumb_w, thumb_h
-    )
-    row_r = build_single_cam_debug_panel(
-        right_frame, right_mask_dbg, right_overlay, right_caption, thumb_w, thumb_h
-    )
-    h = max(row_l.shape[0], row_r.shape[0])
-    if row_l.shape[0] != h:
-        row_l = cv2.resize(row_l, (int(row_l.shape[1] * h / row_l.shape[0]), h))
-    if row_r.shape[0] != h:
-        row_r = cv2.resize(row_r, (int(row_r.shape[1] * h / row_r.shape[0]), h))
-    return np.hstack((row_l, row_r))
-
-
-def save_debug_images(
-    out_dir: str, frame: np.ndarray, mask_dbg: np.ndarray, overlay: np.ndarray, tag: str
-):
-    os.makedirs(out_dir, exist_ok=True)
-    ts = int(time.time() * 1000)
-    cv2.imwrite(os.path.join(out_dir, f"{ts}_{tag}_input.jpg"), frame)
-    cv2.imwrite(os.path.join(out_dir, f"{ts}_{tag}_mask.jpg"), mask_dbg)
-    cv2.imwrite(os.path.join(out_dir, f"{ts}_{tag}_overlay.jpg"), overlay)
-
-
-def write_preview_stills(
-    dir_path: str,
-    frame_bgr: np.ndarray,
-    overlay: np.ndarray,
-    mask_dbg: np.ndarray,
-    caption: str,
-    left_bundle: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, str]] = None,
-    dual_stack: Optional[np.ndarray] = None,
-) -> None:
-    """
-    Fixed filenames overwritten each call — easy to SCP or open from a network share to see
-    what the vehicle sees (same idea as input.jpg / output.jpg / mask in other scripts).
-    Writes: input.jpg, overlay.jpg, mask.jpg, stack.jpg for the **RIGHT** (driving) camera.
-    If ``left_bundle`` is set, also writes left_input.jpg, …, left_stack.jpg.
-    If ``dual_stack`` is set, writes stack_dual.jpg (LEFT+RIGHT combined).
-    """
-    os.makedirs(dir_path, exist_ok=True)
-    cv2.imwrite(os.path.join(dir_path, "input.jpg"), frame_bgr)
-    cv2.imwrite(os.path.join(dir_path, "overlay.jpg"), overlay)
-    cv2.imwrite(os.path.join(dir_path, "mask.jpg"), mask_dbg)
-    stacked = build_single_cam_debug_panel(frame_bgr, mask_dbg, overlay, caption)
-    cv2.imwrite(os.path.join(dir_path, "stack.jpg"), stacked)
-    if left_bundle is not None:
-        lf, lo, lm, lcap = left_bundle
-        cv2.imwrite(os.path.join(dir_path, "left_input.jpg"), lf)
-        cv2.imwrite(os.path.join(dir_path, "left_overlay.jpg"), lo)
-        cv2.imwrite(os.path.join(dir_path, "left_mask.jpg"), lm)
-        cv2.imwrite(
-            os.path.join(dir_path, "left_stack.jpg"),
-            build_single_cam_debug_panel(lf, lm, lo, lcap),
-        )
-    if dual_stack is not None:
-        cv2.imwrite(os.path.join(dir_path, "stack_dual.jpg"), dual_stack)
-
-
+# Build a dual camera debug panel (One row: [LEFT raw|mask|ov] [RIGHT raw|mask|ov] so both cameras fit in a browser without vertical scrolling (MJPEG / remote viewing).)
 def main():
     ap = argparse.ArgumentParser(
-        description="Right-camera lane follow: camera_part3 fitLine+PD (default) or histogram mode"
+        description="Dual-camera lane centering: fitLine (default) or histogram lane detection"
     )
     ap.add_argument("--port", default=PORT, help="TM4C serial port")
     ap.add_argument("--baud", type=int, default=BAUD, help="TM4C serial baud")
@@ -1415,52 +1155,16 @@ def main():
         help="OpenCV index for the RIGHT-side lane camera",
     )
     ap.add_argument(
-        "--preview-left-camera",
-        action="store_true",
-        help="Open LEFT at --left-index for dual preview. Implied when using --http-preview-port "
-        "unless --http-single-cam-preview. Steering always uses RIGHT only.",
-    )
-    ap.add_argument(
         "--left-index",
         type=int,
         default=LEFT_CAM_INDEX,
-        help="OpenCV index for optional LEFT preview camera",
+        help="OpenCV index for the LEFT-side lane camera",
     )
     ap.add_argument(
         "--left-lane-target",
         type=float,
         default=LEFT_LANE_TARGET_RATIO_DEFAULT,
-        help="Target column ratio for LEFT preview overlays (camera_part3 used ~0.43 for left lane)",
-    )
-    ap.add_argument(
-        "--scan-indices",
-        default="0,1,2,3,4,5,6",
-        help="Fallback camera indices to probe when a side camera fails",
-    )
-    ap.add_argument("--show", action="store_true", help="Show OpenCV debug windows")
-    ap.add_argument(
-        "--save-debug", action="store_true", help="Save debug images on keypress 's'"
-    )
-    ap.add_argument(
-        "--debug-dir", default="./camera_debug", help="Folder for saved debug images"
-    )
-    ap.add_argument(
-        "--preview-stills",
-        action="store_true",
-        help="Continuously overwrite input.jpg, overlay.jpg, mask.jpg, stack.jpg in "
-        "--preview-stills-dir (see --preview-stills-every). For remote inspection without a display.",
-    )
-    ap.add_argument(
-        "--preview-stills-dir",
-        default="./vehicle_preview",
-        help="Directory for --preview-stills fixed filenames",
-    )
-    ap.add_argument(
-        "--preview-stills-every",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Write preview stills every N frames (default 1; use 5–15 to reduce USB/disk load)",
+        help="Target column ratio for LEFT lane overlay / steering (camera_part3 used ~0.43 for left lane)",
     )
     ap.add_argument(
         "--http-preview-port",
@@ -1474,35 +1178,6 @@ def main():
         "--http-bind",
         default="0.0.0.0",
         help="Bind address for --http-preview-port (default all interfaces)",
-    )
-    ap.add_argument(
-        "--http-single-cam-preview",
-        action="store_true",
-        help="With --http-preview-port: do not open the LEFT USB camera; stream RIGHT strip only. "
-        "By default, HTTP preview tries to open LEFT+RIGHT (same as --preview-left-camera).",
-    )
-    ap.add_argument(
-        "--dual-preview-layout",
-        choices=("rows", "wide"),
-        default="rows",
-        help="When both cameras are open: rows=LEFT on first line, RIGHT below (default); "
-        "wide=single line of six tiles (LEFT|RIGHT side by side).",
-    )
-    ap.add_argument(
-        "--control-mode",
-        choices=("dual-center", "right-only"),
-        default="dual-center",
-        help="dual-center: both cameras, steer between lane lines; forward when centered. "
-        "right-only: previous single RIGHT-camera modes (fitline/histogram).",
-    )
-    ap.add_argument(
-        "--swap-lr-cameras",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="dual-center only: USB indices (--left-index / --right-index) often do not match which "
-        "lens is physically on the left vs right of the vehicle. Default ON: assign the stream "
-        "opened as --right-index to LEFT lane processing and --left-index to RIGHT. "
-        "Use --no-swap-lr-cameras if your preview labels already match reality.",
     )
     ap.add_argument(
         "--center-deadband",
@@ -1575,19 +1250,13 @@ def main():
         "--lane-detector",
         choices=("fitline", "histogram"),
         default="fitline",
-        help="fitline=camera_part3 HLS+fitLine+PD; histogram=column peak+hysteresis",
-    )
-    ap.add_argument(
-        "--legacy-part3-pd-steering",
-        action="store_true",
-        help="fitline mode only: use camera_part3 PD→motor sign (may fight right-lane logic). "
-        "Omit this flag so +error steers Left Half away from the right stripe.",
+        help="fitline=camera_part3 HLS+fitLine; histogram=column peak+hysteresis",
     )
     ap.add_argument(
         "--right-lane-target",
         type=float,
         default=RIGHT_LANE_TARGET_RATIO_DEFAULT,
-        help="Green line on overlay / PD target column (camera_part3 right lane used 0.65).",
+        help="Target column ratio for RIGHT lane overlay / steering (camera_part3 right lane used 0.65).",
     )
     ap.add_argument(
         "--turn-left-enter",
@@ -1616,13 +1285,6 @@ def main():
         help="Lower values reduce USB bandwidth (e.g. 10-15 on a shared hub)",
     )
     ap.add_argument(
-        "--right-cam-width",
-        type=int,
-        default=0,
-        help="If >0 with --right-cam-height, right camera only uses this resolution (saves USB)",
-    )
-    ap.add_argument("--right-cam-height", type=int, default=0)
-    ap.add_argument(
         "--hsv-v-min",
         type=int,
         default=HSV_V_MIN,
@@ -1647,19 +1309,12 @@ def main():
     if args.target_goal_band > 0.45:
         print("[WARN] --target-goal-band very large; capping display at 0.45")
         args.target_goal_band = 0.45
-    if args.control_mode == "dual-center" and args.http_single_cam_preview:
-        print(
-            "[ERROR] dual-center mode needs both cameras — remove --http-single-cam-preview "
-            "or use --control-mode right-only.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
     lo, hi = sorted((args.turn_left_enter, args.turn_left_exit))
     if lo != args.turn_left_exit or hi != args.turn_left_enter:
         print("[WARN] Using --turn-left-exit < --turn-left-enter; values were normalized.")
     args.turn_left_exit = lo
     args.turn_left_enter = hi if hi > lo + 1e-6 else lo + 0.06
-    scan_indices = parse_indices_csv(args.scan_indices)
+    scan_indices = [0, 1, 2, 3, 4, 5, 6]
 
     ser = None
     mc = None
@@ -1679,73 +1334,19 @@ def main():
         mc.send(CMD_STOP, force=True)
         time.sleep(0.2)
 
-        signal.signal(signal.SIGINT, emergency_shutdown)   # Ctrl+C
-        signal.signal(signal.SIGTERM, emergency_shutdown)  # kill
-        signal.signal(signal.SIGTSTP, emergency_shutdown)  # Ctrl+Z
+        signal.signal(signal.SIGINT, emergency_shutdown)   # Ctrl+C to exit
 
-        open_left_preview = False
-        if args.control_mode == "dual-center":
-            caps, used_idxs = initialize_dual_lane_cameras(args, scan_indices)
-            if caps is None:
-                raise RuntimeError(
-                    "dual-center mode could not open BOTH cameras (USB bandwidth or wrong --left-index / --right-index)."
-                )
-            GLOBAL_CAPS = caps
-            print(
-                f"[CAM] dual-center: LEFT index={used_idxs['LEFT']} "
-                f"RIGHT index={used_idxs['RIGHT']} detector={args.lane_detector} "
-                f"(swap_lr_cameras={'on' if args.swap_lr_cameras else 'off'})"
+        caps, used_idxs = initialize_dual_lane_cameras(args, scan_indices)
+        if caps is None:
+            raise RuntimeError(
+                "Could not open BOTH cameras (USB bandwidth or wrong --left-index / --right-index)."
             )
-        else:
-            caps, used_idxs = initialize_right_lane_camera(args, scan_indices)
-            if caps is None:
-                raise RuntimeError("Could not open RIGHT lane camera at startup")
-            GLOBAL_CAPS = caps
-            print(
-                f"[CAM] RIGHT camera index={used_idxs['RIGHT']} "
-                f"(detector={args.lane_detector})"
-            )
-            open_left_preview = args.preview_left_camera or (
-                args.http_preview_port > 0 and not args.http_single_cam_preview
-            )
-            if open_left_preview:
-                time.sleep(CAM_SECOND_OPEN_DELAY_SEC)
-                lcap, lidx = initialize_optional_left_preview_camera(
-                    args, scan_indices, used_idxs.get("RIGHT")
-                )
-                if lcap is None:
-                    print(
-                        "[CAM] Dual preview: could not open LEFT camera (continuing RIGHT-only). "
-                        "Try --http-single-cam-preview if USB bandwidth is the issue."
-                    )
-                    print_camera_troubleshooting()
-                else:
-                    caps["LEFT"] = lcap
-                    used_idxs["LEFT"] = lidx
-                    print(
-                        f"[CAM] LEFT camera index={lidx} (preview only; steering uses RIGHT). "
-                        f"HTTP dual layout: --dual-preview-layout {args.dual_preview_layout} (rows=stacked)."
-                    )
-            elif args.http_preview_port > 0 and args.http_single_cam_preview:
-                print("[CAM] HTTP preview: RIGHT camera only (--http-single-cam-preview).")
-        if args.preview_stills:
-            extra = ""
-            if open_left_preview or args.control_mode == "dual-center":
-                extra = " + left_*.jpg stack_dual.jpg (if LEFT opens)"
-            print(
-                f"[CAM] --preview-stills -> {os.path.abspath(args.preview_stills_dir)}/"
-                f" input.jpg … stack.jpg{extra} "
-                f"(every {max(1, args.preview_stills_every)} frame(s))"
-            )
-        if (
-            args.control_mode == "right-only"
-            and args.lane_detector == "fitline"
-            and not args.legacy_part3_pd_steering
-        ):
-            print(
-                "[CAM] fitline PD: right-lane semantics (+pd_u -> Left Half away from stripe). "
-                "Use --legacy-part3-pd-steering only if you matched raw camera_part3 wiring."
-            )
+        GLOBAL_CAPS = caps
+        print(
+            f"[CAM] dual-center: LEFT index={used_idxs['LEFT']} "
+            f"RIGHT index={used_idxs['RIGHT']} detector={args.lane_detector} "
+            "(fixed LR mapping)"
+        )
         if args.invert_steer:
             print("[CAM] --invert-steer: Left/Right serial commands swapped at output")
 
@@ -1755,566 +1356,233 @@ def main():
 
         while True:
             force_stop_motors(mc, ser)
-            begin_msg = (
-                "Left + right cameras ready. Type 'begin' then press Enter to start: "
-                if args.control_mode == "dual-center"
-                else "Right camera is ready. Type 'begin' then press Enter to start: "
-            )
+            begin_msg = "Left + right cameras ready. Type 'begin' then press Enter to start: "
             user_cmd = input(begin_msg).strip().lower()
             if user_cmd == "begin":
                 break
             print("[INFO] Waiting for 'begin'...")
 
-        st.steer_state = "STRAIGHT"
         st.line_right_ema = None
-        st.lost_frames = 0
         st.read_phase = 0
         cap = caps["RIGHT"]
         GLOBAL_CAP = cap
 
         prev_t = time.time()
-        if args.show:
-            try:
-                cv2.namedWindow("CameraOnly Debug", cv2.WINDOW_NORMAL)
-            except cv2.error as e:
-                print(f"[WARN] OpenCV display unavailable, disabling --show: {e}")
-                args.show = False
 
-        if args.control_mode == "dual-center":
-            st.line_left_ema = None
-            st.lost_both_frames = 0
-            st.center_prev_e = 0.0
-            st.last_lateral_cmd = None
-            st.blind_pulse_until = 0.0
-            st.blind_in_turn_phase = True
-            frame_cache_left = None
-            frame_cache_right = None
-            stale_left = 0
-            stale_right = 0
-            dual_miss_streak = 0
-            cam_recoveries_done = 0
+        st.line_left_ema = None
+        st.lost_both_frames = 0
+        st.center_prev_e = 0.0
+        st.last_lateral_cmd = None
+        st.blind_pulse_until = 0.0
+        st.blind_in_turn_phase = True
+        frame_cache_left = None
+        frame_cache_right = None
+        stale_left = 0
+        stale_right = 0
+        dual_miss_streak = 0
+        cam_recoveries_done = 0
 
-            while True:
-                if st.read_phase % 2 == 0:
-                    ret_r, frame_right_new = caps["RIGHT"].read()
-                    ret_l, frame_left_new = caps["LEFT"].read()
-                else:
-                    ret_l, frame_left_new = caps["LEFT"].read()
-                    ret_r, frame_right_new = caps["RIGHT"].read()
-                st.read_phase += 1
-                GLOBAL_CAP = caps["RIGHT"]
-
-                if ret_r:
-                    frame_cache_right = frame_right_new
-                    stale_right = 0
-                else:
-                    stale_right += 1
-                if ret_l:
-                    frame_cache_left = frame_left_new
-                    stale_left = 0
-                else:
-                    stale_left += 1
-
-                if not ret_r and not ret_l:
-                    dual_miss_streak += 1
-                else:
-                    dual_miss_streak = 0
-
-                if frame_cache_right is None or frame_cache_left is None:
-                    force_stop_motors(mc, ser)
-                    print("[CAM] Waiting for initial frames from both cameras...")
-                    time.sleep(0.01)
-                    continue
-
-                dropout = (
-                    stale_left > MAX_STALE_FRAMES_PER_CAM
-                    or stale_right > MAX_STALE_FRAMES_PER_CAM
-                    or dual_miss_streak > MAX_CONSECUTIVE_DUAL_MISS
-                )
-                if dropout:
-                    print(
-                        "[CAM] Camera dropout "
-                        f"(stale_L={stale_left}, stale_R={stale_right}, dual_miss={dual_miss_streak})"
-                    )
-                    recover_side = (
-                        "RIGHT"
-                        if dual_miss_streak > MAX_CONSECUTIVE_DUAL_MISS
-                        else ("RIGHT" if stale_right > stale_left else "LEFT")
-                    )
-                    if cam_recoveries_done < MAX_CAM_RECOVERIES_PER_RUN and try_recover_one_camera(
-                        caps, used_idxs, recover_side, scan_indices, args
-                    ):
-                        cam_recoveries_done += 1
-                        stale_left = stale_right = 0
-                        dual_miss_streak = 0
-                        st.line_left_ema = None
-                        st.line_right_ema = None
-                        st.center_prev_e = 0.0
-                        st.last_lateral_cmd = None
-                        st.blind_pulse_until = 0.0
-                        st.blind_in_turn_phase = True
-                        frame_cache_left = frame_cache_right = None
-                        force_stop_motors(mc, ser)
-                        print("[CAM] Recovered; waiting for fresh frames from both cameras.")
-                        continue
-                    print("[CAM] Giving up camera recovery -> STOP")
-                    mc.send(CMD_STOP)
-                    break
-
-                frame_right = frame_cache_right.copy()
-                frame_left = frame_cache_left.copy()
-                if MIRROR_FRAME:
-                    frame_right = cv2.flip(frame_right, 1)
-                    frame_left = cv2.flip(frame_left, 1)
-
-                tgtL = float(args.left_lane_target)
-                tgtR = float(args.right_lane_target)
-
-                left_overlay, left_mask_dbg, line_L, err_L, det_L = process_frame(
-                    frame_left,
-                    args.lane_detector,
-                    tgtL,
-                    float(args.turn_left_enter),
-                    float(args.turn_left_exit),
-                    hsv_v_min=int(args.hsv_v_min),
-                    hls_l_min=int(args.hls_l_min),
-                    hls_s_max=int(args.hls_s_max),
-                    lane_roi_side="left",
-                    green_line_thickness=int(args.green_line_thickness),
-                    target_goal_band_ratio=float(args.target_goal_band),
-                )
-                right_overlay, right_mask_dbg, line_R, err_R, det_R = process_frame(
-                    frame_right,
-                    args.lane_detector,
-                    tgtR,
-                    float(args.turn_left_enter),
-                    float(args.turn_left_exit),
-                    hsv_v_min=int(args.hsv_v_min),
-                    hls_l_min=int(args.hls_l_min),
-                    hls_s_max=int(args.hls_s_max),
-                    lane_roi_side="right",
-                    green_line_thickness=int(args.green_line_thickness),
-                    target_goal_band_ratio=float(args.target_goal_band),
-                )
-
-                wL = frame_left.shape[1]
-                wR = frame_right.shape[1]
-                st.line_left_ema = smooth_line_x_ema(st.line_left_ema, line_L, wL)
-                st.line_right_ema = smooth_line_x_ema(st.line_right_ema, line_R, wR)
-
-                nL = st.line_left_ema / wL if st.line_left_ema is not None else None
-                nR = st.line_right_ema / wR if st.line_right_ema is not None else None
-
-                vis = classify_lane_visibility(line_L, line_R)
-
-                if vis == "BOTH" and nL is not None and nR is not None:
-                    e = center_error_both(nL, nR, tgtL, tgtR)
-                    de = e - st.center_prev_e
-                    st.center_prev_e = e
-                else:
-                    e = 0.0
-                    de = 0.0
-
-                cmd, logic = choose_steering_dual_center(
-                    vis,
-                    e,
-                    de,
-                    nL,
-                    nR,
-                    float(args.single_left_danger),
-                    float(args.single_right_danger),
-                    float(args.center_deadband),
-                    float(args.dual_u_thresh),
-                )
-
-                if vis == "NONE":
-                    st.lost_both_frames += 1
-                    if st.last_lateral_cmd in (CMD_LEFT, CMD_RIGHT):
-                        cmd = st.last_lateral_cmd
-                        logic = (
-                            "LOST_COAST_L"
-                            if cmd == CMD_LEFT
-                            else "LOST_COAST_R"
-                        )
-                    else:
-                        cmd = CMD_FWD
-                        logic = "LOST_BOTH_FWD_SEARCH"
-                else:
-                    st.lost_both_frames = 0
-
-                desired_cmd = cmd
-                desired_logic = logic
-                if desired_cmd in (CMD_LEFT, CMD_RIGHT):
-                    st.last_lateral_cmd = desired_cmd
-
-                now_mono = time.monotonic()
-                pulse_on = bool(args.blind_turn_pulse) and float(args.blind_pulse_turn_sec) > 0.0
-                cmd, logic = apply_blind_turn_pulse(
-                    st,
-                    vis,
-                    desired_cmd,
-                    desired_logic,
-                    now_mono,
-                    float(args.blind_pulse_turn_sec),
-                    float(args.blind_pulse_wait_sec),
-                    pulse_on,
-                )
-
-                cmd_motor = apply_steer_inversion(cmd, args.invert_steer)
-                mc.send(cmd_motor)
-                st.last_cmd = cmd_motor
-
-                now = time.time()
-                fps = 1.0 / max(1e-6, (now - prev_t))
-                prev_t = now
-
-                print(
-                    f"[TELEM][DUAL] cmd={cmd_motor} vis={vis} e={e:+.4f} {logic} "
-                    f"Lx={line_L} Rx={line_R} detL={det_L} detR={det_R} "
-                    f"lost_both={st.lost_both_frames} fps={fps:.1f}"
-                )
-
-                caption = (
-                    f"DUAL {vis} {logic} e={e:+.3f} OUT={cmd_motor} | "
-                    f"L={det_L} R={det_R}"
-                )
-                dual_stack = None
-                if args.dual_preview_layout == "wide":
-                    dual_stack = build_dual_cam_debug_panel_side_by_side(
-                        frame_left,
-                        left_mask_dbg,
-                        left_overlay,
-                        f"LEFT | {det_L}",
-                        frame_right,
-                        right_mask_dbg,
-                        right_overlay,
-                        f"RIGHT | {det_R} | {caption}",
-                    )
-                else:
-                    dual_stack = build_dual_cam_debug_panel(
-                        frame_left,
-                        left_mask_dbg,
-                        left_overlay,
-                        f"LEFT | {det_L}",
-                        frame_right,
-                        right_mask_dbg,
-                        right_overlay,
-                        f"RIGHT | {det_R} | {caption}",
-                    )
-
-                if args.preview_stills and (
-                    st.read_phase % max(1, args.preview_stills_every) == 0
-                ):
-                    try:
-                        write_preview_stills(
-                            args.preview_stills_dir,
-                            frame_right,
-                            right_overlay,
-                            right_mask_dbg,
-                            caption,
-                            left_bundle=(
-                                frame_left,
-                                left_overlay,
-                                left_mask_dbg,
-                                f"LEFT | {det_L}",
-                            ),
-                            dual_stack=dual_stack,
-                        )
-                    except cv2.error as ex:
-                        print(f"[WARN] preview stills write failed: {ex}")
-
-                stacked = None
-                if args.show or args.http_preview_port > 0:
-                    stacked = dual_stack
-                    if args.http_preview_port > 0 and stacked is not None:
-                        ok, jpg = cv2.imencode(
-                            ".jpg", stacked, [cv2.IMWRITE_JPEG_QUALITY, 72]
-                        )
-                        if ok:
-                            preview_state.set_jpeg(jpg.tobytes())
-
-                if args.show and stacked is not None:
-                    try:
-                        cv2.imshow("CameraOnly Debug", stacked)
-                        k = cv2.waitKey(1) & 0xFF
-                        if k == ord("q") or k == 27:
-                            print("[INFO] Quit requested")
-                            break
-                        if k == ord("s") and args.save_debug:
-                            save_debug_images(
-                                args.debug_dir,
-                                frame_right,
-                                right_mask_dbg,
-                                right_overlay,
-                                "RIGHT",
-                            )
-                            save_debug_images(
-                                args.debug_dir,
-                                frame_left,
-                                left_mask_dbg,
-                                left_overlay,
-                                "LEFT",
-                            )
-                            print(f"[DEBUG] Saved snapshot to {args.debug_dir}")
-                    except cv2.error:
-                        pass
-                else:
-                    time.sleep(0.002)
-
-        else:
-            pd_tracker: Optional[SimpleLineTracker] = None
-    
-            frame_cache_right = None
-            stale_right = 0
-            miss_streak = 0
-            cam_recoveries_done = 0
-    
-            while True:
+        while True:
+            if st.read_phase % 2 == 0:
                 ret_r, frame_right_new = caps["RIGHT"].read()
-                st.read_phase += 1
-                GLOBAL_CAP = caps["RIGHT"]
-    
-                if ret_r:
-                    frame_cache_right = frame_right_new
-                    stale_right = 0
-                    miss_streak = 0
-                else:
-                    stale_right += 1
-                    miss_streak += 1
-    
-                if frame_cache_right is None:
-                    force_stop_motors(mc, ser)
-                    print("[CAM] Waiting for initial frame from RIGHT camera...")
-                    time.sleep(0.01)
-                    continue
-    
-                dropout = stale_right > MAX_STALE_FRAMES_PER_CAM or miss_streak > MAX_CONSECUTIVE_DUAL_MISS
-                if dropout:
-                    print(
-                        "[CAM] Camera dropout detected "
-                        f"(stale_right={stale_right}, miss_streak={miss_streak})"
-                    )
-    
-                    if cam_recoveries_done < MAX_CAM_RECOVERIES_PER_RUN and try_recover_one_camera(
-                        caps, used_idxs, "RIGHT", scan_indices, args
-                    ):
-                        cam_recoveries_done += 1
-                        stale_right = 0
-                        miss_streak = 0
-                        st.line_right_ema = None
-                        frame_cache_right = None
-                        pd_tracker = None
-                        force_stop_motors(mc, ser)
-                        print("[CAM] Recovered stream; waiting for fresh frame.")
-                        continue
-    
-                    print(
-                        "[CAM] Giving up (recovery failed or max recoveries "
-                        f"{MAX_CAM_RECOVERIES_PER_RUN}) -> STOP"
-                    )
-                    mc.send(CMD_STOP)
-                    break
-    
-                frame_right = frame_cache_right.copy()
-    
-                if MIRROR_FRAME:
-                    frame_right = cv2.flip(frame_right, 1)
-    
-                target_ratio = float(args.right_lane_target)
-                w_right_px = frame_right.shape[1]
-                if args.lane_detector == "fitline":
-                    if (
-                        pd_tracker is None
-                        or pd_tracker.w != w_right_px
-                        or abs(pd_tracker.target_x_ratio - target_ratio) > 1e-6
-                    ):
-                        pd_tracker = SimpleLineTracker(w_right_px, target_ratio)
-    
-                right_overlay, right_mask_dbg, line_right, err_right, det_tag = process_frame(
-                    frame_right,
-                    args.lane_detector,
-                    target_ratio,
-                    float(args.turn_left_enter),
-                    float(args.turn_left_exit),
-                    hsv_v_min=int(args.hsv_v_min),
-                    hls_l_min=int(args.hls_l_min),
-                    hls_s_max=int(args.hls_s_max),
-                    lane_roi_side="right",
-                    green_line_thickness=int(args.green_line_thickness),
-                    target_goal_band_ratio=float(args.target_goal_band),
-                )
-    
-                left_bundle: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, str]] = None
-                if caps.get("LEFT") is not None:
-                    ret_l, frame_left_new = caps["LEFT"].read()
-                    if ret_l:
-                        frame_left = frame_left_new.copy()
-                        if MIRROR_FRAME:
-                            frame_left = cv2.flip(frame_left, 1)
-                        left_t = float(args.left_lane_target)
-                        lo, lm, _, _, ldet = process_frame(
-                            frame_left,
-                            args.lane_detector,
-                            left_t,
-                            float(args.turn_left_enter),
-                            float(args.turn_left_exit),
-                            hsv_v_min=int(args.hsv_v_min),
-                            hls_l_min=int(args.hls_l_min),
-                            hls_s_max=int(args.hls_s_max),
-                            lane_roi_side="left",
-                            green_line_thickness=int(args.green_line_thickness),
-                            target_goal_band_ratio=float(args.target_goal_band),
-                        )
-                        left_bundle = (
-                            frame_left,
-                            lo,
-                            lm,
-                            f"LEFT preview | {args.lane_detector} | {ldet} | no steer | tgt={left_t:.2f}",
-                        )
-    
-                now = time.time()
-                fps = 1.0 / max(1e-6, (now - prev_t))
-                prev_t = now
-    
-                pd_u = 0.0
-                logic = ""
-    
-                if line_right is None:
-                    st.lost_frames += 1
-                    st.line_right_ema = None
-                    st.steer_state = "STRAIGHT"
-                    if pd_tracker is not None:
-                        pd_tracker.prev_err = 0.0
-                    cmd = CMD_STOP
-                    x_norm = float("nan")
-                elif args.lane_detector == "fitline":
-                    st.lost_frames = 0
-                    assert pd_tracker is not None
-                    pd_u, _ = pd_tracker.control_from_x(line_right)
-                    cmd, logic = choose_part3_pd_cmd(
-                        pd_u, right_lane_semantics=not args.legacy_part3_pd_steering
-                    )
-                    x_norm = float(line_right) / float(w_right_px)
-                else:
-                    st.lost_frames = 0
-                    st.line_right_ema = smooth_line_x_ema(
-                        st.line_right_ema, line_right, w_right_px
-                    )
-                    x_norm = float(st.line_right_ema) / float(w_right_px)
-                    cmd, st.steer_state = choose_avoid_right_stripe(
-                        x_norm,
-                        st.steer_state,
-                        float(args.turn_left_enter),
-                        float(args.turn_left_exit),
-                    )
-                    logic = st.steer_state
-    
-                cmd_motor = apply_steer_inversion(cmd, args.invert_steer)
-                mc.send(cmd_motor)
-                st.last_cmd = cmd_motor
-    
-                xn_s = "nan" if line_right is None else f"{x_norm:.3f}"
-                sm_s = (
-                    "nan"
-                    if st.line_right_ema is None
-                    else str(int(st.line_right_ema))
-                )
-                extra = f" pd_u={pd_u:+.3f} {logic}" if args.lane_detector == "fitline" else f" {logic}"
+                ret_l, frame_left_new = caps["LEFT"].read()
+            else:
+                ret_l, frame_left_new = caps["LEFT"].read()
+                ret_r, frame_right_new = caps["RIGHT"].read()
+            st.read_phase += 1
+            GLOBAL_CAP = caps["RIGHT"]
+
+            if ret_r:
+                frame_cache_right = frame_right_new
+                stale_right = 0
+            else:
+                stale_right += 1
+            if ret_l:
+                frame_cache_left = frame_left_new
+                stale_left = 0
+            else:
+                stale_left += 1
+
+            if not ret_r and not ret_l:
+                dual_miss_streak += 1
+            else:
+                dual_miss_streak = 0
+
+            if frame_cache_right is None or frame_cache_left is None:
+                force_stop_motors(mc, ser)
+                print("[CAM] Waiting for initial frames from both cameras...")
+                time.sleep(0.01)
+                continue
+
+            dropout = (
+                stale_left > MAX_STALE_FRAMES_PER_CAM
+                or stale_right > MAX_STALE_FRAMES_PER_CAM
+                or dual_miss_streak > MAX_CONSECUTIVE_DUAL_MISS
+            )
+            if dropout:
                 print(
-                    f"[TELEM] cmd={cmd_motor} mode={args.lane_detector} det={det_tag} x_norm={xn_s} "
-                    f"Rx={None if line_right is None else int(line_right)} smR={sm_s} "
-                    f"e_tgt={err_right:+.3f}{extra} lost={st.lost_frames} staleR={stale_right} fps={fps:.1f}"
+                    "[CAM] Camera dropout "
+                    f"(stale_L={stale_left}, stale_R={stale_right}, dual_miss={dual_miss_streak})"
                 )
-    
-                caption = (
-                    f"{args.lane_detector} OUT={cmd_motor} | {cmd} | det={det_tag} | x/w={xn_s}"
-                    + (
-                        f" | pd={pd_u:+.2f}"
-                        if args.lane_detector == "fitline"
-                        else f" | enter>{args.turn_left_enter:.2f} exit<{args.turn_left_exit:.2f}"
-                    )
+                recover_side = (
+                    "RIGHT"
+                    if dual_miss_streak > MAX_CONSECUTIVE_DUAL_MISS
+                    else ("RIGHT" if stale_right > stale_left else "LEFT")
                 )
-                dual_stack = None
-                if left_bundle is not None:
-                    lf, lo, lm, lcap = left_bundle
-                    rcap = f"RIGHT (steer) | {caption}"
-                    if args.dual_preview_layout == "wide":
-                        dual_stack = build_dual_cam_debug_panel_side_by_side(
-                            lf,
-                            lm,
-                            lo,
-                            lcap,
-                            frame_right,
-                            right_mask_dbg,
-                            right_overlay,
-                            rcap,
-                        )
-                    else:
-                        dual_stack = build_dual_cam_debug_panel(
-                            lf,
-                            lm,
-                            lo,
-                            lcap,
-                            frame_right,
-                            right_mask_dbg,
-                            right_overlay,
-                            rcap,
-                        )
-    
-                if args.preview_stills and (
-                    st.read_phase % max(1, args.preview_stills_every) == 0
+                if cam_recoveries_done < MAX_CAM_RECOVERIES_PER_RUN and try_recover_one_camera(
+                    caps, used_idxs, recover_side, scan_indices, args
                 ):
-                    try:
-                        write_preview_stills(
-                            args.preview_stills_dir,
-                            frame_right,
-                            right_overlay,
-                            right_mask_dbg,
-                            caption,
-                            left_bundle=left_bundle,
-                            dual_stack=dual_stack,
-                        )
-                    except cv2.error as e:
-                        print(f"[WARN] preview stills write failed: {e}")
-    
-                stacked = None
-                if args.show or args.http_preview_port > 0:
-                    if dual_stack is not None:
-                        stacked = dual_stack
-                    else:
-                        stacked = build_single_cam_debug_panel(
-                            frame_right,
-                            right_mask_dbg,
-                            right_overlay,
-                            caption,
-                        )
-                    if args.http_preview_port > 0:
-                        ok, jpg = cv2.imencode(
-                            ".jpg", stacked, [cv2.IMWRITE_JPEG_QUALITY, 72]
-                        )
-                        if ok:
-                            preview_state.set_jpeg(jpg.tobytes())
-    
-                if args.show and stacked is not None:
-                    try:
-                        cv2.imshow("CameraOnly Debug", stacked)
-                        k = cv2.waitKey(1) & 0xFF
-                        if k == ord("q") or k == 27:
-                            print("[INFO] Quit requested")
-                            break
-                        if k == ord("s") and args.save_debug:
-                            save_debug_images(
-                                args.debug_dir,
-                                frame_right,
-                                right_mask_dbg,
-                                right_overlay,
-                                "RIGHT",
-                            )
-                            print(f"[DEBUG] Saved snapshot to {args.debug_dir}")
-                    except cv2.error:
-                        pass
+                    cam_recoveries_done += 1
+                    stale_left = stale_right = 0
+                    dual_miss_streak = 0
+                    st.line_left_ema = None
+                    st.line_right_ema = None
+                    st.center_prev_e = 0.0
+                    st.last_lateral_cmd = None
+                    st.blind_pulse_until = 0.0
+                    st.blind_in_turn_phase = True
+                    frame_cache_left = frame_cache_right = None
+                    force_stop_motors(mc, ser)
+                    print("[CAM] Recovered; waiting for fresh frames from both cameras.")
+                    continue
+                print("[CAM] Giving up camera recovery -> STOP")
+                mc.send(CMD_STOP)
+                break
+
+            frame_right = frame_cache_right.copy()
+            frame_left = frame_cache_left.copy()
+            if MIRROR_FRAME:
+                frame_right = cv2.flip(frame_right, 1)
+                frame_left = cv2.flip(frame_left, 1)
+
+            tgtL = float(args.left_lane_target)
+            tgtR = float(args.right_lane_target)
+
+            left_overlay, left_mask_dbg, line_L, err_L, det_L = process_frame(
+                frame_left,
+                args.lane_detector,
+                tgtL,
+                float(args.turn_left_enter),
+                float(args.turn_left_exit),
+                hsv_v_min=int(args.hsv_v_min),
+                hls_l_min=int(args.hls_l_min),
+                hls_s_max=int(args.hls_s_max),
+                lane_roi_side="left",
+                green_line_thickness=int(args.green_line_thickness),
+                target_goal_band_ratio=float(args.target_goal_band),
+            )
+            right_overlay, right_mask_dbg, line_R, err_R, det_R = process_frame(
+                frame_right,
+                args.lane_detector,
+                tgtR,
+                float(args.turn_left_enter),
+                float(args.turn_left_exit),
+                hsv_v_min=int(args.hsv_v_min),
+                hls_l_min=int(args.hls_l_min),
+                hls_s_max=int(args.hls_s_max),
+                lane_roi_side="right",
+                green_line_thickness=int(args.green_line_thickness),
+                target_goal_band_ratio=float(args.target_goal_band),
+            )
+
+            wL = frame_left.shape[1]
+            wR = frame_right.shape[1]
+            st.line_left_ema = smooth_line_x_ema(st.line_left_ema, line_L, wL)
+            st.line_right_ema = smooth_line_x_ema(st.line_right_ema, line_R, wR)
+
+            nL = st.line_left_ema / wL if st.line_left_ema is not None else None
+            nR = st.line_right_ema / wR if st.line_right_ema is not None else None
+
+            vis = classify_lane_visibility(line_L, line_R)
+
+            if vis == "BOTH" and nL is not None and nR is not None:
+                e = center_error_both(nL, nR, tgtL, tgtR)
+                de = e - st.center_prev_e
+                st.center_prev_e = e
+            else:
+                e = 0.0
+                de = 0.0
+
+            cmd, logic = choose_steering_dual_center(
+                vis,
+                e,
+                de,
+                nL,
+                nR,
+                float(args.single_left_danger),
+                float(args.single_right_danger),
+                float(args.center_deadband),
+                float(args.dual_u_thresh),
+            )
+
+            if vis == "NONE":
+                st.lost_both_frames += 1
+                if st.last_lateral_cmd in (CMD_LEFT, CMD_RIGHT):
+                    cmd = st.last_lateral_cmd
+                    logic = (
+                        "LOST_COAST_L"
+                        if cmd == CMD_LEFT
+                        else "LOST_COAST_R"
+                    )
                 else:
-                    time.sleep(0.002)
+                    cmd = CMD_FWD
+                    logic = "LOST_BOTH_FWD_SEARCH"
+            else:
+                st.lost_both_frames = 0
+
+            desired_cmd = cmd
+            desired_logic = logic
+            if desired_cmd in (CMD_LEFT, CMD_RIGHT):
+                st.last_lateral_cmd = desired_cmd
+
+            now_mono = time.monotonic()
+            pulse_on = bool(args.blind_turn_pulse) and float(args.blind_pulse_turn_sec) > 0.0
+            cmd, logic = apply_blind_turn_pulse(
+                st,
+                vis,
+                desired_cmd,
+                desired_logic,
+                now_mono,
+                float(args.blind_pulse_turn_sec),
+                float(args.blind_pulse_wait_sec),
+                pulse_on,
+            )
+
+            cmd_motor = apply_steer_inversion(cmd, args.invert_steer)
+            mc.send(cmd_motor)
+            st.last_cmd = cmd_motor
+
+            now = time.time()
+            fps = 1.0 / max(1e-6, (now - prev_t))
+            prev_t = now
+
+            print(
+                f"[TELEM][DUAL] cmd={cmd_motor} vis={vis} e={e:+.4f} {logic} "
+                f"Lx={line_L} Rx={line_R} detL={det_L} detR={det_R} "
+                f"lost_both={st.lost_both_frames} fps={fps:.1f}"
+            )
+
+            caption = (
+                f"DUAL {vis} {logic} e={e:+.3f} OUT={cmd_motor} | "
+                f"L={det_L} R={det_R}"
+            )
+            dual_stack = build_dual_cam_debug_panel(
+                frame_left,
+                left_mask_dbg,
+                left_overlay,
+                f"LEFT | {det_L}",
+                frame_right,
+                right_mask_dbg,
+                right_overlay,
+                f"RIGHT | {det_R} | {caption}",
+            )
+            if args.http_preview_port > 0:
+                ok, jpg = cv2.imencode(
+                    ".jpg", dual_stack, [cv2.IMWRITE_JPEG_QUALITY, 72]
+                )
+                if ok:
+                    preview_state.set_jpeg(jpg.tobytes())
+            time.sleep(0.002)
 
     except KeyboardInterrupt:
         print("\n[INFO] Ctrl-C pressed")
