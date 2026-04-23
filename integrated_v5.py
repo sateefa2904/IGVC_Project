@@ -166,9 +166,9 @@ MIN_AREA             = 80 #old: 80
 MIN_HEIGHT           = 15 #old: 15
 MIN_WIDTH            = 2
 MIN_ASPECT_H_OVER_W  = 1 #old: 0.6,1.0
-ANGLE_TOL_DEG        = 90
+ANGLE_TOL_DEG        = 45
 
-CENTER_DEADBAND = 0.07
+CENTER_DEADBAND = 0.12
 DUAL_KP = 0.6 #0.9 
 DUAL_KD = 0.4
 DUAL_U_THRESH = 0.18
@@ -181,8 +181,8 @@ BLIND_PULSE_WAIT_SEC = 2.0
 
 
 #### changing ratios to avoid spasing
-TARGET_X_RATIO_LEFT = 0.25 # old 0.43
-TARGET_X_RATIO_RIGHT = 0.75 # old 0.65
+TARGET_X_RATIO_LEFT = 0.35 # old 0.43
+TARGET_X_RATIO_RIGHT = 0.65 # old 0.65
 
 # PD gains
 Kp = 0.9
@@ -647,6 +647,10 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker):
         aspect = height / max(1.0, width)
         if aspect < MIN_ASPECT_H_OVER_W:
             continue
+        candidate_angle = rect_angle_from_vertical(rect)
+        if candidate_angle > ANGLE_TOL_DEG:
+            continue
+        
         score = score_component(rect)
         if score > best_score:
             best_score = score
@@ -670,6 +674,10 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker):
         cv2.circle(mask_debug, (int(line_x_bottom), y_bottom-4), 5, (0,0,255), -1)
 
         angle_deg = rect_angle_from_vertical(best_rect)
+        if angle_deg > 45.0:   # too diagonal — not a lane line, skip it
+            best_rect = None
+            line_x_bottom = None
+            angle_deg = None
 
     cv2.line(out, (0, y_top), (w-1, y_top), (255, 0, 0), 1, cv2.LINE_AA)
     cv2.line(mask_debug, (0, y_top), (w-1, y_top), (255, 0, 0), 1, cv2.LINE_AA)
@@ -990,11 +998,12 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
             
             nL = line_x_L / 480 if line_x_L is not None else None
             nR = line_x_R / 480 if line_x_R is not None else None
-            err_L = nL - TARGET_X_RATIO_LEFT
-            err_R = nR - TARGET_X_RATIO_RIGHT
+            
 
             if nL is not None and nR is not None:
                 
+                err_R = nR - TARGET_X_RATIO_RIGHT
+                err_L = nL - TARGET_X_RATIO_LEFT
     
                 # Differential Error: e > 0 means too far right (steer left); e < 0 means too far left
   
@@ -1017,12 +1026,14 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
             elif nL is not None:
                 # Single-side fallback
                 #shared["lane_turn"].value = -0.4 if nL > SINGLE_LEFT_DANGER_RATIO else 0.0
+                err_L = nL - TARGET_X_RATIO_LEFT
                 shared["lane_turn"].value = SINGLE_KP * (-err_L)
                 shared["lane_visible_L"].value = True
                 shared["lane_visible_R"].value = False
             elif nR is not None:
                 # Single-side fallback
                 #shared["lane_turn"].value = 0.4 if nR > SINGLE_RIGHT_DANGER_RATIO else 0.0
+                err_R = nR - TARGET_X_RATIO_RIGHT
                 shared["lane_turn"].value = SINGLE_KP * (-err_R)
                 shared["lane_visible_L"].value = False
                 shared["lane_visible_R"].value = True
