@@ -163,6 +163,7 @@ ROI_RIGHT_CAM = dict(
     bottom_right = (1.00, 0.95),
 )
 
+
 HSV_S_MAX = 70
 HSV_V_MIN = 200
 HSV_H_ANY = (0, 180)
