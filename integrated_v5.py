@@ -1,4 +1,16 @@
+"""
+Autonomous Vehicle Integration System
+=====================================
 
+This module serves as the primary entry point for the self-driving ground vehicle.
+It utilizes Python's `multiprocessing` library to run parallel workers for:
+- Camera capture and lane tracking (OpenCV)
+- Object detection (Ultralytics YOLOv8)
+- Obstacle avoidance (RPLidar)
+- Motor control and telemetry (Serial to TM4C)
+
+The workers communicate via shared memory and thread-safe multiprocessing Values.
+"""
 
 import time
 import math
@@ -20,21 +32,7 @@ from http.server import BaseHTTPRequestHandler
 import threading
 import socketserver
 from typing import List, Optional, Tuple
-# =========================
-# Debug / integration toggles
-# =========================
-# [SAteefa 3/21 Added: top-level mode switch so we can test one subsystem at a time]
-# CAMERA_ONLY = test only lane-following + TM4C output
-# LIDAR_ONLY  = test only obstacle / corridor logic
-# FULL        = full integrated behavior
-
- #CAMERA_ONLY, LIDAR_ONLY, FULL
-
-
-
-GLOBAL_MC = None
-GLOBAL_SERIAL_LOCK = None
-GLOBAL_SER = None
+import multiprocessing as mp
 
 # =========================
 # Serial / driving config
@@ -43,7 +41,6 @@ GLOBAL_SER = None
 SERIAL_LOCK_PATH = "/tmp/tm4c_serial.lock" # DEBUG Phase 1: [SAteefa 3/21: added to enforce one-way pathway and prevent interleaving]
 PORT = "/dev/ttyACM0"   # change if needed
 BAUD = 19200
-EOL = "\r"              # TM4C parser ends on carriage returnn
 DTR = True
 RTS = True
 CHAR_DELAY = 0.005       # 10 ms between bytes
@@ -57,182 +54,17 @@ CMD_AUTO   = "Auto"
 CMD_MANUAL = "Manual"
 STOP_CMD   = "Stop"
 
-# For deciding steering commands from lane PD output
-#TURN_LEFT_THRESH  = -0.20
-#TURN_RIGHT_THRESH =  0.20
-
-##new to avoid wheel spasm:
-# [SAteefa 3/22 Added: hysteresis thresholds to reduce left/right command chatter]
-# LEFT_ENTER_THRESH  = -0.24
-# LEFT_EXIT_THRESH   = -0.12
-# RIGHT_ENTER_THRESH =  0.24
-# RIGHT_EXIT_THRESH  =  0.12
-
-# LEFT_ENTER_THRESH  = -0.25  # Require a bigger error to start turning LEFT
-# LEFT_EXIT_THRESH   = -0.10  # Stop turning sooner
-# RIGHT_ENTER_THRESH =  0.25  # Require a bigger error to start turning RIGHT
-# RIGHT_EXIT_THRESH  =  0.10  # Stop turning sooner
-
-# --- Update these constants at the top of your script ---
-# LEFT_ENTER_THRESH  = -0.06  
-# LEFT_EXIT_THRESH   = -0.02  # Drops back to straight when almost centered
-# RIGHT_ENTER_THRESH =  0.06  
-# RIGHT_EXIT_THRESH  =  0.02
-
-# LEFT_ENTER_THRESH  = -0.06  
-# RIGHT_ENTER_THRESH =  0.06  
-
-# # INCREASE the exit thresholds to stop turning earlier
-# LEFT_EXIT_THRESH   = -0.04  # Was -0.02
-# RIGHT_EXIT_THRESH  =  0.04  # Was 0.02
-LEFT_ENTER_THRESH  = -0.05
-LEFT_EXIT_THRESH   = -0.02
-
-RIGHT_ENTER_THRESH =  0.05
-RIGHT_EXIT_THRESH  =  0.02
-
-
-
-
-
-# =========================
-# LIDAR config / thresholds
-# =========================
-
 LIDAR_PORT   = "/dev/ttyUSB0"
 LIDAR_BAUD   = 1_000_000
 LIDAR_TO     = 1.0
-FRONT_DEG    = 0
-ANGLE_SIGN_D = -1    # -1 if your LIDAR mount is mirrored
 
-LOOK_ANGLES  = [-50, 0, +50]
-ANG_TOL      = 10
-
-FORWARD_SECTORS = {
-    'FR': (-60.0, -10.0),
-    'F' : (-15.0, +15.0),
-    'FL': (+10.0, +60.0),
-}
-
-THRESH_MAIN        = 500   # main "open" threshold (mm)
-BACKOFF_CLEAR_ANY  = 850
-NEAR_OBS_TRIP      = 300   # too close -> back up
-NEAR_OBS_RELEASE   = 500   # safe again
-POST_NEAR_CLEAR    = 672
-
-NO_DATA_STOP_SEC   = 0.5   # stop if no valid LIDAR data for this time
-
-PRINT_INF_AS = -1
-
-# Corridor / middle-road tuning
-CORRIDOR_BALANCE_EPS_MM     = 20.0  # |dL - dR| <= this is "centered"
-CORRIDOR_FORWARD_TIME       = 4.0   # go forward in middle (seconds)
-CORRIDOR_EXIT_TURN_TIME     = 1.5   # turn back toward origin lane (seconds)
-
-# Lane change turning from one lane to the other
-LANE_CHANGE_TURN_TIME       = 1.5   # seconds (both L->R and R->L)
-
-# Alignment threshold: when we consider lane 'turn' "0"
-ALIGN_TURN_EPS              = 0.05  # |turn| <= this => aligned
-
-# =========================
-# Lane / camera tunables
-# =========================
-
-
-# ROI_VERTICES_RATIO = dict(
-#     bottom_left  = (0.05, 0.95),
-#     top_left     = (0.05, 0.35), # Raised from 0.55 to 0.35 to see "further"
-#     top_right    = (0.95, 0.35), # Balanced with top_left
-#     bottom_right = (0.95, 0.95),
-# )
-
-# The Left camera is not allowed to look past 60% of the screen (Right edge blocked)
-ROI_LEFT_CAM = dict(
-    bottom_left  = (0.00, 0.95),
-    top_left     = (0.00, 0.35),
-    top_right    = (0.60, 0.35), 
-    bottom_right = (0.60, 0.95),
-)
-
-# The Right camera is not allowed to look past 40% of the screen (Left edge blocked)
-ROI_RIGHT_CAM = dict(
-    bottom_left  = (0.40, 0.95), 
-    top_left     = (0.40, 0.35),
-    top_right    = (1.00, 0.35),
-    bottom_right = (1.00, 0.95),
-)
-
-
-HSV_S_MAX = 70
-HSV_V_MIN = 200
-HSV_H_ANY = (0, 180)
-
-LAB_A_ABS_MAX = 20
-LAB_B_ABS_MAX = 20
-
-Y_MIN = 210
-CR_ABS_MAX = 14
-CB_ABS_MAX = 14
-
-USE_OTSU_BACKUP = False
-OTSU_RATIO = 0.60
-
-OPEN_K  = (3, 3)
-CLOSE_K = (11, 11)
-
-MIN_AREA             = 80 #old: 80
-MIN_HEIGHT           = 15 #old: 15
-MIN_WIDTH            = 2
-MIN_ASPECT_H_OVER_W  = 1 #old: 0.6,1.0
-ANGLE_TOL_DEG        = 80
-
-CENTER_DEADBAND = 0.1
-DUAL_KP = 1.0 #0.6 #0.9 
-DUAL_KD = 0.4
-DUAL_U_THRESH = 0.18
-# Single-side: creep forward until line norm exceeds these, then turn away from that line.
-SINGLE_LEFT_DANGER_RATIO = 0.40
-SINGLE_RIGHT_DANGER_RATIO = 0.50
-# When not BOTH and steering wants Left/Right: turn briefly, then Stop so cameras can update.
-BLIND_PULSE_TURN_SEC = 1.0
-BLIND_PULSE_WAIT_SEC = 2.0
-
-
-#### changing ratios to avoid spasing
-TARGET_X_RATIO_LEFT = 0.35 # old 0.43
-TARGET_X_RATIO_RIGHT = 0.65 # old 0.65
-
-# PD gains
-Kp = 0.9
-Kd = 0.2
-
-TEST_TURN_SCALE = 1.0
-
-LANE_COLOR   = (255, 255, 255)
-TARGET_COLOR = (0, 255, 0)
-TEXT_COLOR   = (0, 255, 255)
-
-MIRROR_FRAME = False
-
-USE_DISPLAY        = False
-SHOW_STACKED_DEBUG = False
-SAVE_DEBUG_IMAGES = False
-
-
-# Updated paths based on your 'ls -l' output
 LEFT_CAM_INDEX = "/dev/v4l/by-path/platform-3610000.usb-usb-0:1.1.1:1.0-video-index0"
 RIGHT_CAM_INDEX = "/dev/v4l/by-path/platform-3610000.usb-usb-0:1.2:1.0-video-index0"
 CAM_BACKEND     = cv2.CAP_V4L2   # or cv2.CAP_ANY
 
-# lane-loss tolerance (we'll use simple stop on long loss)
-LOST_FRAMES_THRESH = 5
 
-# =========================
-# Stop sign / pedestrian draft config
-# =========================
-
-STOP_SIGN_HOLD_SEC = 2.0  # [SAteefa 3/21 Added: placeholder timed stop for future stop-sign integration]
+USE_DISPLAY        = False
+SHOW_STACKED_DEBUG = False
 
 
 
@@ -297,6 +129,12 @@ class SerialPortLock:
 
 
 def open_serial():
+    """
+    Initializes and opens the serial connection to the TM4C microcontroller.
+
+    Returns:
+        serial.Serial: The active serial connection object.
+    """
     print("Opening serial:", PORT, "@", BAUD)
     ser = serial.Serial(
         PORT, BAUD,
@@ -315,6 +153,14 @@ def open_serial():
     return ser
 
 def send_line_typewriter(ser: serial.Serial, text: str):
+    """
+    Sends a string command over serial, character by character, to avoid buffer overflow.
+
+    Args:
+        ser (serial.Serial): The active serial connection.
+        text (str): The command string to send (e.g., 'Forward Half').
+    """
+    EOL = "\r" 
     data = (text + EOL).encode("ascii", errors="ignore")
     print("TX:", repr(text + EOL), list(data))
     for b in data:
@@ -329,12 +175,27 @@ def send_line_typewriter(ser: serial.Serial, text: str):
 #   - reducing rapid serial spam/jitter
 #   - allowing force=True for critical commands like STOP and AUTO
 class MotorCommander:
+    """
+    Manages high-level motor commands to the TM4C. 
+    Prevents serial spam by suppressing exact duplicates and enforcing a minimum send interval.
+
+    Attributes:
+        ser (serial.Serial): The serial connection object.
+        min_cmd_interval (float): Minimum seconds between identical commands.
+    """
     def __init__(self,ser,min_cmd_interval=0.08):
         self.ser = ser              #serial connection to TM4C
         self.last_cmd = None        #remembers the last command sent
         self.last_send_time = 0.0   # [SAteefa 3/21 added: remembers when the last command was sent]
         self.min_cmd_interval = min_cmd_interval # [SAteefa 3/21 added: minimum delay between non-forced command sends]
     def send(self, cmd:str, force:bool=False):
+        """
+        Evaluates and sends a command to the motors.
+
+        Args:
+            cmd (str): The movement command string.
+            force (bool): If True, bypasses timing restrictions and sends immediately.
+        """
         now = time.time()
 
         same_cmd = (cmd == self.last_cmd)
@@ -358,15 +219,31 @@ class MotorCommander:
 # =========================
 
 def wrap180(a):
+    """Normalizes an angle to be within -180 and +180 degrees."""
     return (a + 180) % 360 - 180
 
 def rel_to_front(a_abs, angle_sign, front_deg):
+    """Calculates the relative angle of a LIDAR point based on the physical mount orientation."""
     return angle_sign * wrap180(a_abs - front_deg)
 
 def fmt_mm(x):
+    """Formats a millimeter distance for console printing, hiding infinite values."""
+    PRINT_INF_AS = -1
+    
     return int(x) if x < math.inf else PRINT_INF_AS
 
 def open_lidar(port, baud, timeout):
+    """
+    Connects to the RPLidar sensor and clears its initial buffers.
+
+    Args:
+        port (str): The USB port (e.g., '/dev/ttyUSB0').
+        baud (int): Baudrate for the lidar connection.
+        timeout (float): Connection timeout in seconds.
+
+    Returns:
+        RPLidar: The initialized Lidar object.
+    """
     lid = RPLidar(port, baudrate=baud, timeout=timeout)
     time.sleep(0.1)
     try:
@@ -400,10 +277,15 @@ def open_lidar(port, baud, timeout):
 
 
 def iter_scans_standard(lidar):
+    """Generator that yields standard scans from the RPLidar."""
     for scan in lidar.iter_scans(max_buf_meas=8192, min_len=40):
         yield scan
 
 def bins_from_scan(scan, angle_sign, front_deg):
+    """Groups lidar points into direct angles (-50, 0, 50 degrees)."""
+    LOOK_ANGLES  = [-50, 0, +50]
+    ANG_TOL      = 10
+    
     bins = {a: math.inf for a in LOOK_ANGLES}
     for q, ang, dist in scan:
         if dist <= 0:
@@ -415,6 +297,13 @@ def bins_from_scan(scan, angle_sign, front_deg):
     return bins
 
 def sectors_from_scan(scan, angle_sign, front_deg):
+    """Groups lidar points into wide frontal sectors for object avoidance."""
+    FORWARD_SECTORS = {
+    'FR': (-60.0, -10.0),
+    'F' : (-15.0, +15.0),
+    'FL': (+10.0, +60.0),
+    }
+    
     sectors = {name: math.inf for name in FORWARD_SECTORS}
     for q, ang, dist in scan:
         if dist <= 0:
@@ -426,11 +315,13 @@ def sectors_from_scan(scan, angle_sign, front_deg):
     return sectors
 
 def combine_min(*vals):
+    """Returns the minimum value from a list, ignoring mathematical infinity."""
     finite = [v for v in vals if not math.isinf(v)]
     return min(finite) if finite else math.inf
 
 class LidarState:
-    def __init__(self, angle_sign, front_deg, no_data_stop_sec=NO_DATA_STOP_SEC):
+    """Maintains the current spatial state of the vehicle's surroundings using Lidar data."""
+    def __init__(self, angle_sign, front_deg, no_data_stop_sec):
         self.angle_sign = angle_sign
         self.front_deg  = front_deg
         self.no_data_stop_sec = no_data_stop_sec
@@ -554,6 +445,17 @@ def region_selection(image, roi_dict):
     return cv2.bitwise_and(image, mask)
 
 def white_mask(bgr):
+    HSV_S_MAX = 70
+    HSV_V_MIN = 200
+    HSV_H_ANY = (0, 180)
+    LAB_A_ABS_MAX = 20
+    LAB_B_ABS_MAX = 20
+    Y_MIN = 210
+    CR_ABS_MAX = 14
+    CB_ABS_MAX = 14
+    USE_OTSU_BACKUP = False
+    OTSU_RATIO = 0.60
+
     hsv  = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     lab  = cv2.cvtColor(bgr, cv2.COLOR_BGR2Lab)
     ycc  = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
@@ -585,6 +487,9 @@ def white_mask(bgr):
     return mask
 
 def morph_clean(mask):
+    OPEN_K  = (3, 3)
+    CLOSE_K = (11, 11)
+
     open_k  = cv2.getStructuringElement(cv2.MORPH_RECT, OPEN_K)
     close_k = cv2.getStructuringElement(cv2.MORPH_RECT, CLOSE_K)
     m = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_k)
@@ -614,12 +519,28 @@ def score_component(rect):
     return area + 0.3*height_bonus + 0.8*bottom_bias
 
 class SimpleLineTracker:
+    """
+    A Proportional-Derivative (PD) controller that calculates steering error 
+    based on a lane line's position on the screen.
+    """
     def __init__(self, w, target_x_ratio: float):
         self.w = w
         self.target_x_ratio = target_x_ratio
         self.prev_err = 0.0
 
     def control_from_x(self, line_x_bottom):
+        """
+        Calculates the steering output needed to center the line.
+
+        Args:
+            line_x_bottom (float): The current X coordinate of the tracked line.
+
+        Returns:
+            tuple: (Steering output command, Normalized Error)
+        """
+        # PD gains
+        KP = 0.9
+        KD = 0.2
         target_x = self.target_x_ratio * self.w
 
         if line_x_bottom is None:
@@ -630,12 +551,13 @@ class SimpleLineTracker:
 
         d = err_norm - self.prev_err
         self.prev_err = err_norm
-        u = Kp * err_norm + Kd * d
+        u = KP * err_norm + KD * d
         u = float(np.clip(u, -1.0, 1.0))
         return u, err_norm
 
 def apply_steering(norm_error):
-    turn = float(np.clip(norm_error, -1.0, 1.0)) * TEST_TURN_SCALE
+    turn_scale = 1.0
+    turn = float(np.clip(norm_error, -1.0, 1.0)) * turn_scale
     forward = 0.6 * (1 - 0.5*abs(turn))
     print(f"[CTRL] forward={forward:.2f} turn={turn:.2f}")
     return forward, turn
@@ -643,6 +565,23 @@ def apply_steering(norm_error):
 # [SAteefa 3/22 Added: hysteresis-based discrete steering decision]
 # Keeps the controller from flipping between LEFT and FORWARD on tiny frame-to-frame noise.
 def choose_cmd_with_hysteresis(turn, steer_state):
+    """
+    Translates a fractional turn value into a discrete TM4C hardware command.
+    Applies hysteresis thresholds to prevent the robot from wiggling on straightaways.
+
+    Args:
+        turn (float): Normalized turn desire (-1.0 to 1.0).
+        steer_state (str): The current driving state ("LEFT", "RIGHT", "STRAIGHT").
+
+    Returns:
+        tuple: (The specific string command, The new state)
+    """
+    LEFT_ENTER_THRESH  = -0.05
+    LEFT_EXIT_THRESH   = -0.02
+
+    RIGHT_ENTER_THRESH =  0.05
+    RIGHT_EXIT_THRESH  =  0.02
+
     if steer_state == "LEFT":
         if turn > LEFT_EXIT_THRESH:
             steer_state = "STRAIGHT"
@@ -663,6 +602,14 @@ def choose_cmd_with_hysteresis(turn, steer_state):
         return CMD_UP, steer_state
 
 def process_frame(frame_bgr, tracker: SimpleLineTracker, roi_dict):
+    LANE_COLOR   = (255, 255, 255)
+    TARGET_COLOR = (0, 255, 0)
+    MIN_AREA             = 80 #old: 80
+    MIN_HEIGHT           = 15 #old: 15
+    MIN_WIDTH            = 2
+    MIN_ASPECT_H_OVER_W  = 1 #old: 0.6,1.0
+
+
     h, w = frame_bgr.shape[:2]
     y_bottom = h - 1
     y_top    = int(h * roi_dict['top_left'][1]) # Use roi_dict here
@@ -687,9 +634,6 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker, roi_dict):
         aspect = height / max(1.0, width)
         if aspect < MIN_ASPECT_H_OVER_W:
             continue
-        # candidate_angle = rect_angle_from_vertical(rect)
-        # if candidate_angle > ANGLE_TOL_DEG:
-        #     continue
         
         score = score_component(rect)
         if score > best_score:
@@ -727,10 +671,6 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker, roi_dict):
         cv2.circle(mask_debug, (int(cx), int(cy)), 5, (0,0,255), -1)
         
         angle_deg = rect_angle_from_vertical(best_rect)
-        # if angle_deg > 45.0:   # too diagonal — not a lane line, skip it
-        #     best_rect = None
-        #     line_x_bottom = None
-        #     angle_deg = None
 
     cv2.line(out, (0, y_top), (w-1, y_top), (255, 0, 0), 1, cv2.LINE_AA)
     cv2.line(mask_debug, (0, y_top), (w-1, y_top), (255, 0, 0), 1, cv2.LINE_AA)
@@ -743,12 +683,7 @@ def process_frame(frame_bgr, tracker: SimpleLineTracker, roi_dict):
     forward, turn = apply_steering(u)
 
     print(f"[TELEM] LineX={line_x_bottom}  ErrNorm={err_norm:+.2f}  AngleAbsDeg={angle_deg}")
-    if SAVE_DEBUG_IMAGES:
-        cv2.imwrite("output_mask.jpg", mask_white)
-        cv2.imwrite("output.jpg", out)
-        cv2.imwrite("input.jpg", frame_bgr)
-        cv2.imwrite("mask.jpg", mask_debug)
-
+    
 
     return out, mask_debug, forward, turn, (angle_deg if angle_deg is not None else 0.0), line_x_bottom, err_norm
 
@@ -780,39 +715,6 @@ def tune_camera_for_speed(cap, label: str):
     fps = cap.get(cv2.CAP_PROP_FPS)
     print(f"[CAM] {label} tuned to ~{w:.0f}x{h:.0f} @ {fps:.1f} FPS")
 
-def open_side_camera(side: str):
-    cap = open_camera_by_index(side)
-    
-    if cap is None:
-        return None
-    
-    tune_camera_for_speed(cap, side)
-    
-    return cap
-
-
-
-def read_camera_step(cap, tracker, active_side):
-    # [SAteefa 3/21 Added: isolated camera read/process logic to make lane debugging cleaner]
-    if cap is None or tracker is None:
-        return None, None, None, None, None, None, None, None, False
-
-    ret, frame = cap.read()
-    
-    if not ret:
-        print(f"[CAM] {active_side}: frame grab failed.")
-        return None, None, None, None, None, None, None, None, False
-
-    if MIRROR_FRAME:
-        frame = cv2.flip(frame, 1)
-    #cv2.imshow('Camera View', frame)
-   
-
-    out, mask_debug, forward, turn, angle_deg, line_x_bottom, err_norm = process_frame(frame, tracker)
-    lane_visible = (line_x_bottom is not None)
-
-    return frame, out, mask_debug, forward, turn, angle_deg, line_x_bottom, err_norm, lane_visible
-
 
 def initialize_system():
     # [SAteefa 3/21 Added: modular startup helper so all debug phases share the same safe initialization]
@@ -822,16 +724,6 @@ def initialize_system():
 
     ser = open_serial()
     mc = MotorCommander(ser)
-
-    global GLOBAL_MC, GLOBAL_SERIAL_LOCK, GLOBAL_SER
-    GLOBAL_MC = mc
-    GLOBAL_SERIAL_LOCK = serial_lock
-    GLOBAL_SER = ser
-
-    # signal.signal(signal.SIGINT, emergency_shutdown)   # Ctrl+C
-    # signal.signal(signal.SIGTERM, emergency_shutdown)  # kill
-    # signal.signal(signal.SIGTSTP, emergency_shutdown)  # Ctrl+Z
-
 
     # [SAteefa 3/21 Added: startup banner to show which script and hardware ports are active]
     print("=" * 60)
@@ -851,7 +743,21 @@ def initialize_system():
 #Isaac Elizarraraz [3/30/2026]
 #This function is passed a frame and returns a list of detected objects
 
+# =========================
+# YOLO Helpers
+# =========================
+
 def detect_objects(frame,detector:YOLO):
+    """
+    Runs YOLOv8 inference on a given video frame to find specific objects.
+
+    Args:
+        frame (np.ndarray): The OpenCV BGR image matrix.
+        detector (YOLO): The instantiated Ultralytics YOLO model.
+
+    Returns:
+        list: A list of dictionaries containing detected labels, bounding boxes, and confidence scores.
+    """
     detections = []
     results = detector(frame, verbose=False)
 
@@ -884,9 +790,15 @@ def detect_objects(frame,detector:YOLO):
 #the measurement may need to be calibrated based on the cameras focal length
 def measure_distance(bbox,focal_length,real_height):
     """
-    focal length is a pre-calibrated focal langth from our camera. Needs to be confirmed, currently a placeholder
-    real_height is the real height of the object being detected
-    distance is returned in meters
+    Estimates distance to an object using the pinhole camera geometry model.
+
+    Args:
+        bbox (tuple): Bounding box coordinates (x1, y1, x2, y2).
+        focal_length (float): Calibrated camera focal length.
+        real_height (float): Known physical height of the object in meters.
+
+    Returns:
+        float: Estimated distance in meters, or None if calculation fails.
     """
     x1,y1,x2,y2 = bbox
     height = abs(y2-y1)
@@ -999,13 +911,32 @@ def read_lidar_step(lidar, scans, lidar_state):
     lidar_state.update_from_scan(scan)
     return lidar, scans, lidar_state, True
 
+# =========================
+# Multiprocessing Workers
+# =========================
+
 def camera_worker(shared, shm_name_L, shm_name_R):
-    cap_L = open_side_camera("LEFT")
-    cap_R = open_side_camera("RIGHT")
+    """
+    Background process that continuously captures frames from two USB cameras 
+    and writes them into high-speed shared memory for the lane and YOLO workers.
+
+    This function initializes the physical camera hardware via V4L2, tunes the 
+    capture resolution and framerate to prevent bottlenecking, and maintains 
+    a tight loop to pull the latest frames.
+
+    Args:
+        shared (dict): Shared multiprocessing variables dictionary.
+        shm_name_L (str): The shared memory reference name for the left camera buffer.
+        shm_name_R (str): The shared memory reference name for the right camera buffer.
+    """
+    cap_L = open_camera_by_index("LEFT")
+    cap_R = open_camera_by_index("RIGHT")
     time.sleep(1)
     if cap_L is None or cap_R is None: 
         print("[CAM] failed to start")
         return
+    tune_camera_for_speed(cap_L, "LEFT")
+    tune_camera_for_speed(cap_R, "RIGHT")
     shm_L = shared_memory.SharedMemory(name=shm_name_L)
     shm_R = shared_memory.SharedMemory(name=shm_name_R)
     
@@ -1026,6 +957,44 @@ def camera_worker(shared, shm_name_L, shm_name_R):
         time.sleep(0.01)
         
 def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
+    """
+    Background process responsible for executing the computer vision pipeline 
+    and Proportional-Derivative (PD) steering control.
+
+    Reads high-speed camera frames from shared memory, applies region-of-interest (ROI) 
+    masking to prevent field-of-view cross-talk, and calculates the required steering 
+    angle to keep the vehicle centered. Features a dual-camera primary mode and a 
+    robust single-camera fallback mode to navigate sharp curves. 
+
+    Args:
+        shared (dict): Shared multiprocessing dictionary to output the calculated 
+                       steering commands ('lane_turn', 'lane_visible_L', 'lane_visible_R').
+        shm_name_L (str): Shared memory reference name for the left camera buffer.
+        shm_name_R (str): Shared memory reference name for the right camera buffer.
+        preview_bundle (tuple): A tuple containing (preview_state, preview_lock) used 
+                                to safely push debug JPG frames to the MJPEG HTTP server.
+    """
+    CENTER_DEADBAND = 0.1
+    DUAL_KP = 1.0 #0.6 #0.9 
+    DUAL_KD = 0.4
+    TARGET_X_RATIO_LEFT = 0.35 # old 0.43
+    TARGET_X_RATIO_RIGHT = 0.65 # old 0.65
+    # The Left camera is not allowed to look past 60% of the screen (Right edge blocked)
+    ROI_LEFT_CAM = dict(
+        bottom_left  = (0.00, 0.95),
+        top_left     = (0.00, 0.35),
+        top_right    = (0.60, 0.35), 
+        bottom_right = (0.60, 0.95),
+    )
+
+    # The Right camera is not allowed to look past 40% of the screen (Left edge blocked)
+    ROI_RIGHT_CAM = dict(
+        bottom_left  = (0.40, 0.95), 
+        top_left     = (0.40, 0.35),
+        top_right    = (1.00, 0.35),
+        bottom_right = (1.00, 0.95),
+    )
+
     preview_state, preview_lock = preview_bundle
     shm_L = shared_memory.SharedMemory(name=shm_name_L)
     shm_R = shared_memory.SharedMemory(name=shm_name_R)
@@ -1036,11 +1005,8 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
     tracker_L = SimpleLineTracker(480, TARGET_X_RATIO_LEFT)
     tracker_R = SimpleLineTracker(480, TARGET_X_RATIO_RIGHT)
 
-    prev_e        = 0.0
-    last_turn     = 0.0   # last turn value we were confident about
-    
-
-
+    prev_e  = 0.0
+   
     print("[LANE PROCESS] started")
     while True:
         img_L = frame_L.copy()
@@ -1057,7 +1023,6 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
             # BOTH cameras: standard dual PD control
             # ------------------------------------------------
             if nL is not None and nR is not None:
-                glitch_count = 0
 
                 current_center = (nL + nR) / 2.0
                 
@@ -1069,10 +1034,8 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
 
                 turn_val = DUAL_KP * error + DUAL_KD * de
 
-                
-
                 turn_val  = float(np.clip(turn_val, -1.0, 1.0))
-                last_turn = turn_val
+
                 if abs(error) < CENTER_DEADBAND:
                     turn_val = 0.0
                 shared["lane_turn"].value      = turn_val 
@@ -1126,9 +1089,17 @@ def lane_worker(shared, shm_name_L, shm_name_R, preview_bundle):
 #Isaac Elizarraraz [3/31/2026]
 #thread worker that finds objects in current frame
 def yolo_worker(shared,shm_name):
+    """
+    Background process that continuously reads shared memory frames and runs 
+    the YOLOv8 object detection model to trigger stop or pedestrian events.
+
+    Args:
+        shared (dict): Shared multiprocessing variables dictionary.
+        shm_name (str): The shared memory reference name for the camera frame.
+    """
 
     detector = YOLO("./yolov8n.pt")
-    detector.to("cpu")
+    detector.to("cpu") # ideally this should be gpu!!
     shm = shared_memory.SharedMemory(name=shm_name)
     frame = np.ndarray((270,480,3), dtype=np.uint8, buffer=shm.buf)
     
@@ -1215,6 +1186,21 @@ def yolo_worker(shared,shm_name):
             print("[YOLO ERROR]", e)
             
 def lidar_worker(shared):
+    """
+    Background process that maintains a continuous serial connection to the RPLidar.
+
+    This worker reads raw point cloud data from the spinning lidar, groups the 
+    points into distinct front-facing sectors (Left, Center, Right), and updates 
+    the shared memory dictionary. It includes robust error handling to automatically 
+    power-cycle and reconnect to the lidar if the data stream drops.
+
+    Args:
+        shared (dict): Shared multiprocessing dictionary where the processed 
+                       distance values ('dL', 'dC', 'dR', 'dFL', 'dF', 'dFR') are stored.
+    """
+    FRONT_DEG    = 0
+    ANGLE_SIGN_D = -1    # -1 if your LIDAR mount is mirrored
+    NO_DATA_STOP_SEC   = 0.5   # stop if no valid LIDAR data for this time
 
     lidar = open_lidar(LIDAR_PORT, LIDAR_BAUD, LIDAR_TO)
     scans = iter_scans_standard(lidar)
@@ -1275,6 +1261,15 @@ def lidar_worker(shared):
         
 
 def run_full_integrated(mc, shared):
+    """
+    The main control loop of the robot. 
+    Reads telemetry from the Lidar, Camera, and YOLO workers, performs 
+    Vector Blending for obstacle avoidance, and dispatches serial commands to the TM4C.
+
+    Args:
+        mc (MotorCommander): The initialized MotorCommander object.
+        shared (dict): Shared multiprocessing variables dictionary.
+    """
 
     last_completed_stop = time.time()
     stop_state_end_time = 0
@@ -1547,8 +1542,6 @@ def run_integrated():
         
 
   
-        
-import multiprocessing as mp
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
